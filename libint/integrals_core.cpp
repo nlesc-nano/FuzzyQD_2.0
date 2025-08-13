@@ -298,25 +298,17 @@ inline void rsh_array_l2(double x,double y,double z,double* o) {
 }
 
 inline void rsh_array_l3(double x,double y,double z,double* o) {
-  const double r2 = 1.0;
-  const double r2sq = r2*r2;
   /* SO order for l=3 : m = -3,-2,-1,0,+1,+2,+3  (7 funcs)
      Libint additionally stores the real tesseral family in
      alphabetical xy(y^2-3x^2) …  We mirror CP2K/Libint layout:  */
-  o[0] = y*(3.0*x*x -   y*y);          // m=-3  (xyz combination)
-  o[1] = x*y*z;                        // m=-2
-  o[2] = y*z*z - y*r2/5.0*     3.0;    // m=-1  (~ yz(5z^2-r^2))
-  o[3] = z*(5.0*z*z - 3.0*r2);         // m= 0
-  o[4] = x*z*z - x*r2/5.0*     3.0;    // m=+1
-  o[5] = z*(x*x - y*y);               // m=+2
-  o[6] = x*(x*x - 3.0*y*y);           // m=+3
+  o[0] = y*(3.0*x*x - y*y);                // m = -3
+  o[1] = 2.0*x*y*z;                         // m = -2
+  o[2] = y*(5.0*z*z - 1.0);                 // m = -1   (since r^2=1 on unit sphere)
+  o[3] = z*(5.0*z*z - 3.0);                 // m =  0
+  o[4] = x*(5.0*z*z - 1.0);                 // m = +1
+  o[5] = z*(x*x - y*y);                     // m = +2
+  o[6] = x*(x*x - 3.0*y*y);                 // m = +3
 
-  /* Libint SO actually has 10 functions for l=3 (real cubic harmonics):
-     the remaining 3 are linear‐independent but orthonormal combinations.
-     For completeness we append them (indices 7‑9): */
-  o[7] = x*y*(x*x - y*y);             // χ_7 (xy(x^2‑y^2))
-  o[8] = (x*x - y*y)*(x*x - 3*y*y);   // χ_8 ((x^2‑y^2)(x^2‑3y^2))
-  o[9] = (3*x*x - y*y)*y*z;           // χ_9 ((3x^2‑y^2)yz)
 }
 
 inline void rsh_array(int l,double x,double y,double z,double* o){
@@ -338,54 +330,70 @@ shell_ft_complex(const libint2::Shell& sh,
   const double klen = k.norm();
   const int l = sh.contr[0].l;
   const size_t nfunc = sh.size();
-  std::vector<std::complex<double>> vals(nfunc, 0.0);
+  std::vector<std::complex<double>> vals(nfunc, std::complex<double>(0.0, 0.0));
+
+  // (-i)^l overall phase for momentum-space solid harmonics
+  const std::complex<double> il = std::pow(std::complex<double>(0.0, -1.0), l);
 
   if (klen < 1e-15) {
-    // limit k->0 (Gamma); rsh well-defined except for l>0 where k^l->0
-    double ang[9]; // enough up to l=2
-    rsh_array(l, 0.0, 0.0, 1.0, ang);  // arbitrary axis; k^l will zero l>0 anyway
-    for (size_t p=0; p<sh.nprim(); ++p) {
+    // k -> 0 (Gamma). For l>0, k^l → 0 so the specific direction is irrelevant.
+    double ang[9];                     // sufficient up to l=3 (we only use first nfunc)
+    rsh_array(l, 0.0, 0.0, 1.0, ang);  // any unit axis
+
+    for (size_t p = 0; p < sh.nprim(); ++p) {
       const double alpha = sh.alpha[p];
       const double coeff = sh.contr[0].coeff[p];
-      const double pref  = coeff * std::pow(M_PI/alpha, 1.5)
-                                 * std::pow(klen/(2*alpha), l)
-                                 * std::exp(-klen*klen/(4*alpha));
-      for (size_t f=0; f<nfunc; ++f)
+      const double Nl    = libint_primitive_norm(l, alpha);
+
+      const std::complex<double> pref =
+          il * (coeff * Nl)
+             * std::pow(M_PI/alpha, 1.5)
+             * std::pow(klen/(2.0*alpha), l)
+             * std::exp(-klen*klen/(4.0*alpha));
+
+      for (size_t f = 0; f < nfunc; ++f)
         vals[f] += pref * ang[f];
     }
     // phase = 1 at k=0
     return vals;
   }
 
+  // Directional part (real tesseral spherical harmonics in SO order)
   const double x = k(0)/klen, y = k(1)/klen, z = k(2)/klen;
-  double ang[9]; rsh_array(l, x,y,z, ang);
+  double ang[9]; rsh_array(l, x, y, z, ang);
 
+  // Radial factor per primitive + normalization and (-i)^l
   for (size_t p = 0; p < sh.nprim(); ++p) {
     const double alpha = sh.alpha[p];
-    const double coeff = sh.contr[0].coeff[p];   // <-- fixed name
-    const double pref  = coeff * std::pow(M_PI/alpha, 1.5)
-                               * std::pow(klen/(2*alpha), l)
-                               * std::exp(-klen*klen/(4*alpha));
+    const double coeff = sh.contr[0].coeff[p];
+    const double Nl    = 1.0;  
+  // libint_primitive_norm(l, alpha);
+
+    const std::complex<double> pref =
+        il * (coeff * Nl)
+           * std::pow(M_PI/alpha, 1.5)
+           * std::pow(klen/(2.0*alpha), l)
+           * std::exp(-klen*klen/(4.0*alpha));
+
     for (size_t f = 0; f < nfunc; ++f)
       vals[f] += pref * ang[f];
   }
 
-  // phase factor e^{-i k·R}
+  // center phase e^{-i k·R}
   const Eigen::Vector3d R{sh.O[0], sh.O[1], sh.O[2]};
-  const std::complex<double> phase =
-      std::exp(std::complex<double>(0.0, -k.dot(R)));
+  const std::complex<double> phase = std::exp(std::complex<double>(0.0, -k.dot(R)));
   for (auto& v : vals) v *= phase;
+
   return vals;
 }
 
-/* real-return shim (drop imag) to keep API backward compatible */
+/* ---- real wrapper to keep old code paths working ------------------------ */
 static std::vector<double>
-shell_ft_real(const libint2::Shell& sh,
-              const Eigen::Vector3d& k) {
-  auto tmp = shell_ft_complex(sh,k);
-  std::vector<double> out(tmp.size());
-  for (size_t i=0;i<tmp.size();++i) out[i] = tmp[i].real(); // drop imag
-  return out;
+shell_ft_real(const libint2::Shell& sh, const Eigen::Vector3d& k) {
+  const auto vc = shell_ft_complex(sh, k);
+  std::vector<double> vr(vc.size());
+  for (size_t i = 0; i < vc.size(); ++i) vr[i] = vc[i].real();
+  return vr;
 }
 
 /* AO-FT matrix: (n_ao × n_k) real-valued (imag dropped) ------------------ */
@@ -415,5 +423,29 @@ Matrix ao_ft(const std::vector<libint2::Shell>& shells,
   return F;
 }
 
+/* AO-FT matrix: (n_ao × n_k) complex-valued */
+Eigen::MatrixXcd ao_ft_complex(const std::vector<libint2::Shell>& shells,
+                               const std::vector<KPoint>& kpts,
+                               int nthreads) {
+  const size_t n_ao = nbasis(shells);
+  const size_t n_k  = kpts.size();
+  Eigen::MatrixXcd F(n_ao, n_k); F.setZero();
+
+  parallel_do([&](int tid){
+    for (size_t kp = 0; kp < n_k; ++kp) {
+      if (kp % nthreads != (size_t)tid) continue;
+      Eigen::Vector3d kvec = kpts[kp].vec();
+      size_t ao0 = 0;
+      for (size_t s = 0; s < shells.size(); ++s) {
+        auto vec = shell_ft_complex(shells[s], kvec);
+        for (size_t f = 0; f < vec.size(); ++f)
+          F(ao0 + f, kp) = vec[f];
+        ao0 += vec.size();
+      }
+    }
+  }, nthreads);
+  return F;
+
+}
 
 } // namespace licpp

@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include <pybind11/eigen.h>          // Eigen ↔ NumPy
+#include <complex>  // now returning complex arrays too
 #include <string>                    // Required for std::string
 #include <libint2.hpp>               // Required for libint2 headers
 // #include <complex>  // -> uncomment when returning complex to Python
@@ -197,4 +198,22 @@ PYBIND11_MODULE(libint_fuzzy, m)
           },
           py::arg("shells"), py::arg("kpoints"), py::arg("nthreads")=1,
           "Analytic AO Fourier transforms along a user supplied k-path");
+
+    // Complex-valued AO FT (keeps phase)
+    m.def("ao_ft_complex",
+          [](py::list py_shells, py::array_t<double> k_array, int nthreads){
+            auto shells = convert_shells(py_shells);
+            std::vector<licpp::KPoint> kpts; auto buf = k_array.unchecked<2>();
+            kpts.reserve(buf.shape(0));
+            for (ssize_t i=0;i<buf.shape(0);++i)
+              kpts.push_back({buf(i,0),buf(i,1),buf(i,2)});
+            libint2::initialize();
+            auto Fc = licpp::ao_ft_complex(shells, kpts, nthreads);
+            libint2::finalize();
+            return Fc;  // Eigen::MatrixXcd → NumPy complex128
+          },
+          py::arg("shells"), py::arg("kpoints"), py::arg("nthreads")=1,
+          "Complex AO Fourier transforms (keeps phase)");
+
+
 }

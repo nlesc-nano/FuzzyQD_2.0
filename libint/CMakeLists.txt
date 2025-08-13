@@ -4,12 +4,9 @@ project(libint_fuzzy LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_compile_definitions(EIGEN_MPL2_ONLY EIGEN_NO_DEBUG)
-
-# Force dynamic libraries (prefer .dylib over .a)
 set(BUILD_SHARED_LIBS ON)
 
-# Always use the conda environment's install location
-# (set this before any find_package)
+# Prefer the active conda environment for find_package
 if(DEFINED ENV{CONDA_PREFIX})
   set(CMAKE_PREFIX_PATH $ENV{CONDA_PREFIX})
 endif()
@@ -23,16 +20,18 @@ pybind11_add_module(libint_fuzzy
     integrals_core.cpp
 )
 
-# --- CORRECTED LINE ---
-# Use the correct imported target 'Libint2::cxx' which includes all dependencies.
+# Link against Libint’s exported target and Eigen
+# Libint2::cxx brings correct compile defs and link flags
+# Eigen3::Eigen is header-only but keep it explicit
+
 target_link_libraries(libint_fuzzy PRIVATE
     Libint2::cxx
     Eigen3::Eigen
 )
 
-# --- CORRECTED LINE ---
-# Also use the correct target name to get the library location for debugging.
-# We query the actual shared library component 'Libint2::int2'.
+# Optional debug output to confirm the resolved shared library
 get_target_property(LIBINT2_LOC Libint2::int2 LOCATION)
 message(STATUS "Libint2 location: ${LIBINT2_LOC}")
+
+
 

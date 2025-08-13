@@ -4,5 +4,5 @@ matplotlib>=3.5
 pymatgen>=2024.0
 seekpath>=2.1
 pybind11>=2.12
-# libint comes via conda; don’t list here
+# libint/eigen come via conda when using conda; don’t list here
 

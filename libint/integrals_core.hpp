@@ -52,5 +52,8 @@ namespace licpp
     Matrix ao_ft(const std::vector<libint2::Shell>& shells,
                  const std::vector<KPoint>& kpts,
                  int nthreads);
-    
+
+    Eigen::MatrixXcd ao_ft_complex(const std::vector<libint2::Shell>&,
+                                   const std::vector<KPoint>&, int nthreads);
+      
 } // namespace licpp
