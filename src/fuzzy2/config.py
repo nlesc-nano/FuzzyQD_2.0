@@ -50,6 +50,10 @@ def get_args():
     group.add_argument('-soc_npz', default=None, help='Path to SOC spinors NPZ (indices, energies_Ha/eV, occupations, U). If provided, spinor pipeline is used.')
     
     # --- Calculation & Plotting ---
+    parser.add_argument('--mo_ivk', nargs='*', type=int, default=None,
+                        help='List of MO indices to plot intensity vs k. If omitted, plot first N HOMOs and N LUMOs.')
+    parser.add_argument('--mo_ivk_n', type=int, default=5,
+                        help='How many HOMOs and LUMOs to plot when --mo_ivk not given.')
     parser.add_argument("-ewin", nargs=2, type=float, required=True, metavar=("EMIN", "EMAX"),
                         help="Energy window [min, max] for plotting in eV.")
     parser.add_argument('-ewin_pad_ev', type=float, default=None,
@@ -64,6 +68,23 @@ def get_args():
                         help="Optional gamma for intensity normalization: I -> I^gamma.")
     parser.add_argument("-scaled_vmin", type=float, default=None,
                         help="Optional scaled vmin for intensity plot.")
+
+    # Threading / BLAS control
+    parser.add_argument("--no_thread_autoset", action="store_true",
+        help="Do not auto-configure OpenMP/BLAS threads; use the environment as-is.")
+    parser.add_argument("--blas_threads", type=int, default=1,
+        help="Threads for MKL/OpenBLAS (default: 1; set 0 to leave unchanged).")
+
+    # --- Cube export ---
+    parser.add_argument("--cube", action="store_true",
+        help="Export selected MOs as Gaussian cube files after plotting.")
+    parser.add_argument("--cube_spacing", type=float, default=0.40,
+        help="Cube grid spacing in bohr (default 0.40 ≈ 0.21 Å).")
+    parser.add_argument("--cube_padding", type=float, default=6.0,
+        help="Cube margin around molecule in bohr (default 6.0).")
+    parser.add_argument("--cube_part", choices=["real","imag","abs","abs2"], default="real",
+        help="If MO coefficients are complex, which part to write (default real).")
+    
     
     args = parser.parse_args()
     return args

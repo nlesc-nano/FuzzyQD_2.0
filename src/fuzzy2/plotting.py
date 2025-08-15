@@ -143,7 +143,7 @@ def fuzzy_band_imshow(kpts_cart, labels, eps_Ha, intensity,
     else:
         plt.show()
 
-def plot_mo_intensity(kpts_cart, labels, k_path_dist, intensity, eps_Ha, mo_indices, gamma_norm=None, outfile_prefix="mo_intensity"):
+def plot_mo_intensity_old(kpts_cart, labels, k_path_dist, intensity, eps_Ha, mo_indices, gamma_norm=None, outfile_prefix="mo_intensity"):
     """
     Plots the projection intensity |Ψ_n(k)|² for selected MOs.
     """
@@ -183,9 +183,51 @@ def plot_mo_intensity(kpts_cart, labels, k_path_dist, intensity, eps_Ha, mo_indi
         print(f"✓ MO intensity plot saved to {outfile}")
         plt.close(fig)
 
+def plot_mo_intensity(kpts_cart, labels, k_path_dist, I_nk, eps_Ha, mo_indices,
+                      gamma_norm=None, outfile_prefix="mo_intensity"):
+    """
+    I_nk: (n_states, n_k) intensity per MO n vs k.
+    eps_Ha: (n_states,) energies in Hartree (for titles/filenames).
+    mo_indices: list of state indices to export/plot.
+    """
+    kpts_cart = np.asarray(kpts_cart)
+    # deduplicate back-to-back labels like Γ|Γ (strict)
+    kpts_dedup, labels_dedup, keep = dedup_kpath_strict(kpts_cart, labels)
+    kd = k_path_dist[keep]
+    Id = I_nk[:, keep]
+
+    # k ticks at labeled points
+    tick_pos, tick_lab, prev = [], [], None
+    for x, lab in zip(kd, labels_dedup):
+        if lab and lab != prev:
+            tick_pos.append(x)
+            tick_lab.append(_fmt_k_label(lab))   # or _plain_k_label(lab) if you prefer
+            prev = lab
+    
+    for n in mo_indices:
+        E_eV = eps_Ha[n]*config.HARTREE_TO_EV
+        y = Id[n]
+        if gamma_norm is not None:
+            y = y**gamma_norm
+
+        fig, ax = plt.subplots(figsize=(8, 2.4), constrained_layout=True)
+        ax.plot(kd, y)
+        ax.set_xlim(kd[0], kd[-1])
+        ax.set_xlabel("k-path distance (Å⁻¹)")
+        ax.set_ylabel("Intensity (arb.)")
+        ax.set_xticks(tick_pos); ax.set_xticklabels(tick_lab, fontsize=10)
+        for xc in tick_pos:
+            ax.axvline(xc, color='gray', lw=0.5, alpha=0.5)
+        ax.set_title(f"MO n={n}  E={E_eV:.3f} eV")
+        out = f"{outfile_prefix}_n{n:04d}_{E_eV:+.3f}eV.png"
+        plt.savefig(out, dpi=180)
+        print("plot →", out)
+        plt.close(fig)
+
+
 def plot_fuzzy_map_spinors(kpts_cart, labels, k_path_dist, energies_eV, intensity,
                            ewin, sigma_ev=0.10, gamma_norm=None, scaled_vmin=1e-4, 
-                           outfile="fuzzy_soc.png", blur_sigma=None):
+                           outfile="fuzzy_soc.png", blur_sigma=None, midgap=None):
     # 0) deduplicate like your original (keep HS endpoints)
     kpts_cart = np.asarray(kpts_cart)
     from .plotting import dedup_kpath_strict as _dedup   # if defined elsewhere
@@ -237,14 +279,24 @@ def plot_fuzzy_map_spinors(kpts_cart, labels, k_path_dist, energies_eV, intensit
     # 5) draw
     fig, ax = plt.subplots(figsize=(9,5), facecolor="white")
     extent = [x_min, x_max, centres.min(), centres.max()]
+
+    # Use a copy so we can edit bad/under colors
+    cmap = plt.colormaps.get_cmap("inferno").copy()
+    cmap.set_bad('black')   # NaN / masked -> black
+    cmap.set_under('black') # values < vmin (LogNorm underflow) -> black
+    
     im = ax.imshow(Z, origin='lower', aspect='auto', extent=extent,
-                   cmap=plt.colormaps.get_cmap("inferno"), norm=norm)
+                   cmap=cmap, norm=norm)
+    ax.set_facecolor('black')   # keep the axes background black
+
     ax.set_ylim(ewin)
     ax.set_xticks(tick_pos); ax.set_xticklabels(tick_lab, fontsize=11)
     for xc in tick_pos:
         ax.axvline(xc, color='gray', lw=0.5, alpha=0.6)
     ax.set_xlabel("k-path distance (Å⁻¹)")
     ax.set_ylabel("Energy (eV)")
+    if midgap is not None:
+        ax.axhline(midgap, color='white', lw=1.2, ls='--', alpha=0.9)
     cb = plt.colorbar(im, ax=ax, pad=0.02, extend='both')
     cb.set_label("Intensity (arb.)", fontsize=11)
     plt.tight_layout()

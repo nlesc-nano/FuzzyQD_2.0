@@ -337,4 +337,55 @@ def load_soc_spinors_npz(npz_path, verbose=True):
         print(f"[SOC] Loaded spinors: U {U.shape} (complex), energies {eps_eV.shape}, in {took:.2f}s from {os.path.basename(npz_path)}")
     return U, eps_eV, occ, indices
 
+def configure_threading(nthreads: int, blas_threads: int = 1, quiet: bool = False):
+    """
+    Configure OpenMP (Libint/Eigen) and BLAS threading to avoid oversubscription.
+    - OMP: nthreads, bind threads to cores
+    - BLAS: blas_threads (default 1 to avoid oversubscription)
+    If threadpoolctl is present, adjusts pools at runtime too.
+    """
+    import os
+
+    nthreads = max(1, int(nthreads))
+    if blas_threads is None:
+        blas_threads = 1
+    blas_threads = int(blas_threads)
+
+    # -- Set env defaults if not already set --
+    def _set_default(key, val):
+        if key not in os.environ or not os.environ[key].strip():
+            os.environ[key] = str(val)
+
+    _set_default("OMP_NUM_THREADS", nthreads)
+    _set_default("OMP_PROC_BIND", "close")
+    _set_default("OMP_PLACES", "cores")
+    if blas_threads > 0:
+        _set_default("MKL_NUM_THREADS", blas_threads)
+        _set_default("OPENBLAS_NUM_THREADS", blas_threads)
+        _set_default("NUMEXPR_NUM_THREADS", blas_threads)
+
+    # -- Try runtime adjustment via threadpoolctl --
+    set_rt = False
+    info = []
+    try:
+        from threadpoolctl import threadpool_limits, threadpool_info
+        if blas_threads > 0:
+            threadpool_limits(blas_threads, user_api=["blas", "openmp", "mkl", "openblas"])
+            set_rt = True
+        info = threadpool_info()
+    except Exception:
+        pass
+
+    # -- Summary printout --
+    if not quiet:
+        def _get(k): return os.environ.get(k, "<unset>")
+        print(f"[threads] OMP_NUM_THREADS={_get('OMP_NUM_THREADS')}  "
+              f"OMP_PROC_BIND={_get('OMP_PROC_BIND')}  OMP_PLACES={_get('OMP_PLACES')}")
+        print(f"[threads] MKL_NUM_THREADS={_get('MKL_NUM_THREADS')}  "
+              f"OPENBLAS_NUM_THREADS={_get('OPENBLAS_NUM_THREADS')}  "
+              f"(runtime set: {'yes' if set_rt else 'no'})")
+        if info:
+            rows = [f"    {lib.get('internal_api','?'):>7} | {lib.get('num_threads','?'):>2} | {lib.get('filename','?')}"
+                    for lib in info]
+            print("[threads] loaded pools:\n" + "\n".join(rows))
 

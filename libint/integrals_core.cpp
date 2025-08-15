@@ -1,4 +1,5 @@
 #include "integrals_core.hpp"
+#include <omp.h>
 #include <cmath> // For std::tgamma and std::pow
 #include <complex>   // <-- added
 #ifdef _OPENMP
@@ -343,7 +344,7 @@ shell_ft_complex(const libint2::Shell& sh,
     for (size_t p = 0; p < sh.nprim(); ++p) {
       const double alpha = sh.alpha[p];
       const double coeff = sh.contr[0].coeff[p];
-      const double Nl    = libint_primitive_norm(l, alpha);
+      const double Nl    = 1.0; // // avoid double normalization; matches k>0 branch
 
       const std::complex<double> pref =
           il * (coeff * Nl)
@@ -447,5 +448,326 @@ Eigen::MatrixXcd ao_ft_complex(const std::vector<libint2::Shell>& shells,
   return F;
 
 }
+
+
+/* ---- Solid-harmonic AO values at a single real-space point --------------
+   Evaluates one Libint 'pure' (spherical) shell at r, returning (2l+1) values
+   in SO order (same ordering you use for FT and everywhere else).
+--------------------------------------------------------------------------- */
+static std::vector<double>
+shell_values_realspace(const libint2::Shell& sh, const Eigen::Vector3d& r) {
+  const int l = sh.contr[0].l;
+  const size_t nfunc = sh.size();         // 2l+1 for pure
+  std::vector<double> out(nfunc, 0.0);
+
+  const Eigen::Vector3d R = r - Eigen::Vector3d(sh.O[0], sh.O[1], sh.O[2]);
+  const double r2 = R.squaredNorm();
+  const double rr = std::sqrt(r2);
+
+  // Unit direction; for rr=0, set direction arbitrary, but r^l makes l>0 vanish.
+  double nx=0.0, ny=0.0, nz=1.0;
+  if (rr > 1e-20) { nx = R[0]/rr; ny = R[1]/rr; nz = R[2]/rr; }
+
+  // Angular array in Libint SO order
+  double ang[16]; // enough up to l=3; you already guard l>3 in rsh_array
+  rsh_array(l, nx, ny, nz, ang);  // reuses your existing real harmonics
+  // Radial factor common to all m: sum_p c_p * N_l(alpha_p) * r^l * exp(-alpha_p r^2)
+  double radial = 0.0;
+  for (size_t p = 0; p < sh.nprim(); ++p) {
+    const double a  = sh.alpha[p];
+    const double c  = sh.contr[0].coeff[p];
+    const double Nl = 1.0; //libint_primitive_norm(l, a);  // // primitives already normalized by convention used in coeffs
+    const double rl = (l==0 ? 1.0 : std::pow(rr, l));
+    radial += c * Nl * rl * std::exp(-a * r2);
+  }
+
+  for (size_t m = 0; m < nfunc; ++m)
+    out[m] = radial * ang[m];
+
+  return out;
+}
+
+/* ---- Concatenate AO values for all shells on many points ---------------- */
+
+// --- fast AO values on arbitrary points (shell-major, vectorized) ----------
+Eigen::MatrixXd ao_values_at_points(
+    const std::vector<libint2::Shell>& shells,
+    const std::vector<Eigen::Vector3d>& points,
+    int nthreads) {
+
+  const size_t npts = points.size();
+  const size_t nao  = nbasis(shells);
+  Eigen::MatrixXd A(nao, npts);
+  A.setZero();
+
+  // Flatten points into three Eigen vectors for cache-friendly math
+  Eigen::VectorXd Px(npts), Py(npts), Pz(npts);
+  for (size_t i = 0; i < npts; ++i) {
+    Px[i] = points[i][0];
+    Py[i] = points[i][1];
+    Pz[i] = points[i][2];
+  }
+
+  const auto s2bf = map_shell_to_basis_function(shells);
+
+  #pragma omp parallel for num_threads(nthreads) schedule(dynamic)
+  for (ptrdiff_t s = 0; s < (ptrdiff_t)shells.size(); ++s) {
+    const auto& sh = shells[(size_t)s];
+    const int l = sh.contr[0].l;
+    const size_t nfunc = sh.size();
+    const double Cx = sh.O[0], Cy = sh.O[1], Cz = sh.O[2];
+
+    // Coordinates relative to shell center
+    Eigen::ArrayXd x = Px.array() - Cx;
+    Eigen::ArrayXd y = Py.array() - Cy;
+    Eigen::ArrayXd z = Pz.array() - Cz;
+    Eigen::ArrayXd xx = x*x, yy = y*y, zz = z*z;
+    Eigen::ArrayXd r2 = xx + yy + zz;
+
+    // Radial contraction: sum_p coeff_p * exp(-alpha_p * r^2)
+    // (Nl = 1.0 here to avoid double normalization)
+    Eigen::ArrayXd radial = Eigen::ArrayXd::Zero(npts);
+    for (size_t p = 0; p < sh.nprim(); ++p) {
+      const double a = sh.alpha[p];
+      const double c = sh.contr[0].coeff[p];
+      radial += c * (-a * r2).exp();
+    }
+
+    // Solid-harmonic polynomials (SO order) multiplied by 'radial'
+    Eigen::MatrixXd block(nfunc, npts);
+    if (l == 0) {
+      block.row(0) = radial.matrix();
+    } else if (l == 1) {
+      // p: [y, z, x]
+      block.row(0) = (radial * y).matrix();
+      block.row(1) = (radial * z).matrix();
+      block.row(2) = (radial * x).matrix();
+    } else if (l == 2) {
+      // d (SO): [xy, yz, (3z^2 - r^2), zx, (x^2 - y^2)]
+      block.row(0) = (radial * (x*y)).matrix();
+      block.row(1) = (radial * (y*z)).matrix();
+      block.row(2) = (radial * (3.0*zz - (xx+yy+zz))).matrix();
+      block.row(3) = (radial * (z*x)).matrix();
+      block.row(4) = (radial * (xx - yy)).matrix();
+    } else if (l == 3) {
+      // f (SO): [ y(3x^2-y^2), 2xyz, y(5z^2 - r^2), z(5z^2 - 3r^2),
+      //           x(5z^2 - r^2), z(x^2 - y^2), x(x^2 - 3y^2) ]
+      Eigen::ArrayXd r2 = (xx + yy + zz);
+      block.row(0) = (radial * (y * (3.0*xx - yy))).matrix();
+      block.row(1) = (radial * (2.0*x*y*z)).matrix();
+      block.row(2) = (radial * (y * (5.0*zz - r2))).matrix();
+      block.row(3) = (radial * (z * (5.0*zz - 3.0*r2))).matrix();
+      block.row(4) = (radial * (x * (5.0*zz - r2))).matrix();
+      block.row(5) = (radial * (z * (xx - yy))).matrix();
+      block.row(6) = (radial * (x * (xx - 3.0*yy))).matrix();
+    } else {
+      continue;
+    }
+    
+    const size_t bf0 = s2bf[(size_t)s];
+    A.middleRows((Eigen::Index)bf0, (Eigen::Index)nfunc) = block;
+  }
+
+  return A;
+}
+
+// --- project MOs at arbitrary points (tiled, no A materialization) ---------
+// Psi(nm, npts) = sum_shells [ C_rows(l)^H(nm x nfunc) · block(nfunc x tlen) ]
+// where 'block' are solid-harmonic AO values for this shell over a tile.
+// Policy: hand-evaluated AOs use Nl = 1.0 (avoid double normalization).
+Eigen::MatrixXd project_mos_at_points(
+    const std::vector<libint2::Shell>& shells,
+    const Eigen::MatrixXcd& Csub,                 // (nao, nm)
+    const std::vector<Eigen::Vector3d>& points,
+    const std::string& part,
+    int nthreads) {
+
+  const size_t npts = points.size();
+  const size_t nm   = static_cast<size_t>(Csub.cols());
+
+  // Flatten points once
+  Eigen::VectorXd Px(npts), Py(npts), Pz(npts);
+  for (size_t i = 0; i < npts; ++i) {
+    Px[i] = points[i][0];
+    Py[i] = points[i][1];
+    Pz[i] = points[i][2];
+  }
+
+  const auto s2bf = map_shell_to_basis_function(shells);
+
+  Eigen::MatrixXd Psi_all((Eigen::Index)nm, (Eigen::Index)npts);
+  Psi_all.setZero();
+
+  // Tile length (tune if you like). 4096–8192 is usually sweet on modern CPUs.
+  const ptrdiff_t TL = 4096;
+
+  #pragma omp parallel for schedule(dynamic) num_threads(nthreads)
+  for (ptrdiff_t t0 = 0; t0 < (ptrdiff_t)npts; t0 += TL) {
+    const ptrdiff_t tlen = std::min<ptrdiff_t>(TL, (ptrdiff_t)npts - t0);
+
+    // Tile coords (arrays)
+    Eigen::ArrayXd x = Px.segment(t0, tlen).array();
+    Eigen::ArrayXd y = Py.segment(t0, tlen).array();
+    Eigen::ArrayXd z = Pz.segment(t0, tlen).array();
+
+    // Local accumulator for this tile (real; we’ll re-do complex if needed)
+    Eigen::MatrixXd Psi_tile = Eigen::MatrixXd::Zero((Eigen::Index)nm, tlen);
+
+    // Loop shells
+    for (size_t s = 0; s < shells.size(); ++s) {
+      const auto& sh = shells[s];
+      const int l = sh.contr[0].l;
+      const size_t nfunc = sh.size();
+      if (l > 3) continue; // up to f, per your ask
+
+      // Shifted coordinates relative to shell center
+      const double Cx = sh.O[0], Cy = sh.O[1], Cz = sh.O[2];
+      Eigen::ArrayXd xs = x - Cx;
+      Eigen::ArrayXd ys = y - Cy;
+      Eigen::ArrayXd zs = z - Cz;
+
+      Eigen::ArrayXd xxs = xs*xs, yys = ys*ys, zzs = zs*zs;
+      Eigen::ArrayXd r2s = xxs + yys + zzs;
+      Eigen::ArrayXd rr  = r2s.sqrt();               // r
+      Eigen::ArrayXd rl  = Eigen::ArrayXd::Ones(tlen);
+      if (l == 1) rl = rr;
+      else if (l == 2) rl = rr.square();
+      else if (l == 3) rl = rr*rr.square();
+
+      // Radial contraction with Nl = 1.0 (avoid double normalization)
+      Eigen::ArrayXd radial = Eigen::ArrayXd::Zero(tlen);
+      for (size_t p = 0; p < sh.nprim(); ++p) {
+        const double a = sh.alpha[p];
+        const double c = sh.contr[0].coeff[p];
+        radial += c * (-a * r2s).exp();
+      }
+      radial *= rl;   // multiply r^l
+
+      // Angular part in Libint SO order — same polynomials as rsh_array_*,
+      // but vectorized (no per-point loops). Matches your definitions above.
+
+      Eigen::MatrixXd block((Eigen::Index)nfunc, tlen);
+
+      if (l == 0) {
+        // Y00 ~ const
+        block.row(0) = radial.matrix();
+      }
+      else if (l == 1) {
+        // p (SO): [y, z, x]
+        block.row(0) = (radial * ys).matrix();
+        block.row(1) = (radial * zs).matrix();
+        block.row(2) = (radial * xs).matrix();
+      }
+      else if (l == 2) {
+        // d (SO): [xy, yz, (3z^2 - r^2), zx, (x^2 - y^2)]
+        block.row(0) = (radial * (xs*ys)).matrix();
+        block.row(1) = (radial * (ys*zs)).matrix();
+        block.row(2) = (radial * (3.0*zzs - (xxs + yys + zzs))).matrix();
+        block.row(3) = (radial * (zs*xs)).matrix();
+        block.row(4) = (radial * (xxs - yys)).matrix();
+      }
+      else { // l == 3
+        // f (SO): using the same family you encoded in rsh_array_l3 (unit-sphere forms)
+        // Here we need the *solid* harmonics (no 1/r factors), so we multiply
+        // by r^3 via 'radial *= rl' above and then use the polynomials
+        // expressed in x,y,z directly:
+        // SO order: m = -3,-2,-1,0,+1,+2,+3  → 7 functions
+        // y(3x^2 - y^2), 2xyz, y(5z^2 - r^2), z(5z^2 - 3r^2),
+        // x(5z^2 - r^2), z(x^2 - y^2), x(x^2 - 3y^2)
+        Eigen::ArrayXd r2 = (xxs + yys + zzs);
+        block.row(0) = (radial * (ys * (3.0*xxs - yys))).matrix();
+        block.row(1) = (radial * (2.0*xs*ys*zs)).matrix();
+        block.row(2) = (radial * (ys * (5.0*zzs - r2))).matrix();
+        block.row(3) = (radial * (zs * (5.0*zzs - 3.0*r2))).matrix();
+        block.row(4) = (radial * (xs * (5.0*zzs - r2))).matrix();
+        block.row(5) = (radial * (zs * (xxs - yys))).matrix();
+        block.row(6) = (radial * (xs * (xxs - 3.0*yys))).matrix();
+      }
+
+      // Accumulate: Psi_tile += C_rows^H * block
+      const size_t bf0 = s2bf[s];
+      const Eigen::Index nfunc_i = (Eigen::Index)nfunc;
+      // C_rows: (nfunc, nm)
+      Eigen::MatrixXcd C_rows = Csub.middleRows((Eigen::Index)bf0, nfunc_i);
+      // (nm, tlen) += (nm, nfunc) * (nfunc, tlen)
+      Psi_tile.noalias() += (C_rows.adjoint() * block).real();
+    } // shells
+
+    // If the user requested imag/abs/abs2, recompute in complex for this tile.
+    if (part != "real") {
+      Eigen::MatrixXcd Psi_c = Eigen::MatrixXcd::Zero((Eigen::Index)nm, tlen);
+
+      for (size_t s = 0; s < shells.size(); ++s) {
+        const auto& sh = shells[s];
+        const int l = sh.contr[0].l;
+        const size_t nfunc = sh.size();
+        if (l > 3) continue;
+
+        const double Cx = sh.O[0], Cy = sh.O[1], Cz = sh.O[2];
+        Eigen::ArrayXd xs = x - Cx;
+        Eigen::ArrayXd ys = y - Cy;
+        Eigen::ArrayXd zs = z - Cz;
+        Eigen::ArrayXd xxs = xs*xs, yys = ys*ys, zzs = zs*zs;
+        Eigen::ArrayXd r2s = xxs + yys + zzs;
+        Eigen::ArrayXd rr  = r2s.sqrt();
+        Eigen::ArrayXd rl  = Eigen::ArrayXd::Ones(tlen);
+        if (l == 1) rl = rr;
+        else if (l == 2) rl = rr.square();
+        else if (l == 3) rl = rr*rr.square();
+
+        Eigen::ArrayXd radial = Eigen::ArrayXd::Zero(tlen);
+        for (size_t p = 0; p < sh.nprim(); ++p) {
+          const double a = sh.alpha[p];
+          const double c = sh.contr[0].coeff[p];
+          radial += c * (-a * r2s).exp();
+        }
+        radial *= rl;
+
+        Eigen::MatrixXd block((Eigen::Index)nfunc, tlen);
+        if (l == 0) {
+          block.row(0) = radial.matrix();
+        } else if (l == 1) {
+          block.row(0) = (radial * ys).matrix();
+          block.row(1) = (radial * zs).matrix();
+          block.row(2) = (radial * xs).matrix();
+        } else if (l == 2) {
+          block.row(0) = (radial * (xs*ys)).matrix();
+          block.row(1) = (radial * (ys*zs)).matrix();
+          block.row(2) = (radial * (3.0*zzs - (xxs + yys + zzs))).matrix();
+          block.row(3) = (radial * (zs*xs)).matrix();
+          block.row(4) = (radial * (xxs - yys)).matrix();
+        } else { // l == 3
+          Eigen::ArrayXd r2 = (xxs + yys + zzs);
+          block.row(0) = (radial * (ys * (3.0*xxs - yys))).matrix();
+          block.row(1) = (radial * (2.0*xs*ys*zs)).matrix();
+          block.row(2) = (radial * (ys * (5.0*zzs - r2))).matrix();
+          block.row(3) = (radial * (zs * (5.0*zzs - 3.0*r2))).matrix();
+          block.row(4) = (radial * (xs * (5.0*zzs - r2))).matrix();
+          block.row(5) = (radial * (zs * (xxs - yys))).matrix();
+          block.row(6) = (radial * (xs * (xxs - 3.0*yys))).matrix();
+        }
+
+        const size_t bf0 = s2bf[s];
+        Eigen::MatrixXcd C_rows = Csub.middleRows((Eigen::Index)bf0, (Eigen::Index)nfunc);
+        Psi_c.noalias() += (C_rows.adjoint() * block);
+      }
+
+      if (part == "imag")
+        Psi_tile = Psi_c.imag();
+      else if (part == "abs")
+        Psi_tile = Psi_c.cwiseAbs().matrix().cast<double>();
+      else // abs2
+        Psi_tile = Psi_c.cwiseAbs2().matrix().cast<double>();
+    }
+
+    // Commit tile (unique columns → no races)
+    Psi_all.middleCols(t0, tlen) = Psi_tile;
+  }
+
+  return Psi_all;
+}
+
+
+
 
 } // namespace licpp

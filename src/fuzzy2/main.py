@@ -36,6 +36,14 @@ def main():
 
     # --- [0] Parse CLI Arguments ---
     args = config.get_args()
+    if not args.no_thread_autoset:
+        io_utils.configure_threading(
+            nthreads=args.nthreads if hasattr(args, "nthreads") else 1,
+            blas_threads=args.blas_threads,
+            quiet=False
+        )
+    
+
     user_lattice = np.array([args.A1, args.A2, args.A3], dtype=float)
 
     # --- [1] Load Reference Bulk Structure (from CIF, for info only) ---
@@ -131,27 +139,62 @@ def main():
 
     # --- Energy window filtering (apply to both MO and SOC) ---
     emin, emax = args.ewin
-    # Default padding = 3*sigma to keep Gaussian broadening consistent
-    pad = args.ewin_pad_ev if args.ewin_pad_ev is not None else (3.0 * args.sigma_ev if args.sigma_ev else 0.0)
-    emin_eff = emin - pad
-    emax_eff = emax + pad
+    pad = args.ewin_pad_ev if args.ewin_pad_ev is not None else (3.0*args.sigma_ev if args.sigma_ev else 0.0)
+    emin_eff, emax_eff = emin - pad, emax + pad
     
-    # energies_eV: shape (n_states,)
-    # C_like:      shape (n_ao or 2*n_ao, n_states)
-    mask = (eps_eV >= emin_eff) & (eps_eV <= emax_eff)
-    n_before = eps_eV.shape[0]
-    n_after  = int(mask.sum())
+    def _homo_lumo_from_occ(eps_eV_arr, occ_arr, tol=1e-8):
+        """Return (homo_i, lumo_i) indices in the given arrays or (None, None)."""
+        if occ_arr is None or np.size(occ_arr) == 0:
+            return None, None
+        filled = np.where(np.asarray(occ_arr) > tol)[0]
+        if filled.size == 0:
+            return None, None
+        h = filled[-1]
+        l = h + 1 if h + 1 < eps_eV_arr.size else None
+        if l is None:
+            return None, None
+        return h, l
     
-    if n_after == 0:
-        print(f"  ⚠︎ ewin [{emin},{emax}] with pad {pad}eV kept 0 states; keeping all to avoid empty projection.")
+    # 1) HOMO/LUMO on the FULL state list (pre-filter)
+    homo_i_full, lumo_i_full = _homo_lumo_from_occ(eps_eV, occ)
+    if homo_i_full is not None:
+        EH0, EL0 = eps_eV[homo_i_full], eps_eV[lumo_i_full]
+        midgap_full = 0.5*(EH0 + EL0)
+        print(f"[States|FULL] HOMO idx={homo_i_full}, E={EH0:.3f} eV | "
+              f"LUMO idx={lumo_i_full}, E={EL0:.3f} eV | gap={EL0-EH0:.3f} eV")
     else:
-        eps_eV = eps_eV[mask]
-        if 'occupations' in locals() and occupations is not None:
-            occupations = occupations[mask]
-        if 'indices' in locals() and indices is not None:
-            indices = indices[mask]  # keep mapping if you use it later
-        C_like = C_like[:, mask]
-        print(f"  ✓ Energy filter: kept {n_after}/{n_before} states in [{emin},{emax}] (+/−{pad} eV)")
+        midgap_full = 0.5*(emin + emax)
+        print(f"[States|FULL] Occupations unavailable → using ewin center: {midgap_full:.3f} eV")
+    
+    # 2) Build mask and index map FULL→FILTERED
+    mask = (eps_eV >= emin_eff) & (eps_eV <= emax_eff)
+    idx_map = np.flatnonzero(mask)           # positions kept
+    n_before, n_after = eps_eV.size, idx_map.size
+    
+    # 3) Apply filter (only if anything survives)
+    if n_after == 0:
+        print(f"  ⚠︎ ewin [{emin},{emax}] ±{pad} eV kept 0 states; keeping all to avoid empty projection.")
+        eps_eV_f = eps_eV
+        occ_f    = occ
+        C_like_f = C_like
+        # HOMO/LUMO in filtered == full in this edge case
+        homo_i_f, lumo_i_f = homo_i_full, lumo_i_full
+        midgap = midgap_full
+    else:
+        eps_eV_f = eps_eV[idx_map]
+        occ_f    = occ[idx_map] if occ is not None else None
+        C_like_f = C_like[:, idx_map]
+        print(f"  ✓ Energy filter: kept {n_after}/{n_before} states in [{emin},{emax}] (±{pad} eV)")
+    
+        # 4) HOMO/LUMO on the FILTERED list (for plotting/selection)
+        homo_i_f, lumo_i_f = _homo_lumo_from_occ(eps_eV_f, occ_f)
+        midgap = (0.5*(eps_eV_f[homo_i_f] + eps_eV_f[lumo_i_f])
+                  if (homo_i_f is not None) else midgap_full)
+    
+    # From here on, use eps_eV_f / occ_f / C_like_f
+    eps_eV = eps_eV_f
+    occ    = occ_f
+    C_like = C_like_f
 
     # --- [7] Project to k-space ---
     print("\n--- [7] Projecting to k-space: C.T @ F ---")
@@ -167,8 +210,50 @@ def main():
     plotting.plot_fuzzy_map_spinors(
         kpts_cart, labels, k_path_dist, eps_eV, intensity,
         ewin=args.ewin, sigma_ev=args.sigma_ev,
-        gamma_norm=args.gamma_norm, scaled_vmin=args.scaled_vmin, outfile=outfile_name
+        gamma_norm=args.gamma_norm, scaled_vmin=args.scaled_vmin, outfile=outfile_name, midgap=midgap
     )
+
+    # pick which MOs to plot
+    if args.mo_ivk:
+        mo_list = args.mo_ivk
+    elif (homo_i_f is not None) and (homo_i_f + 1 < eps_eV.size):
+        N = args.mo_ivk_n
+        homos = list(range(max(0, homo_i_f - N + 1), homo_i_f + 1))
+        lumos = list(range(homo_i_f + 1, min(homo_i_f + 1 + N, eps_eV.size)))
+        mo_list = homos + lumos
+    else:
+        mo_list = []
+    
+    # data for the MO vs k plot
+    I_nk = intensity  # (n_states, n_k)
+    eps_Ha_out = eps_eV / config.HARTREE_TO_EV
+    
+    if mo_list:
+        plotting.plot_mo_intensity(
+            kpts_cart, labels, k_path_dist,
+            I_nk, eps_Ha_out, mo_list,
+            gamma_norm=args.gamma_norm,
+            outfile_prefix="mo_intensity"
+        )
+     
+        # --- Cube export (after plotting) ---
+        if args.cube:
+            from .cube import write_mo_cubes
+            prefix = getattr(args, "prefix", None) or "system"
+            # 'shells' are already the Python dicts you pass to libint_fuzzy elsewhere
+            paths = write_mo_cubes(
+                prefix=prefix,
+                syms_qd=syms_qd,
+                coords_qd_ang=coords_qd_ang,
+                shells=shells,
+                C_ao_mo=C_like,               # AO→MO (possibly complex)
+                mo_indices=mo_list,
+                spacing_bohr=args.cube_spacing,
+                padding_bohr=args.cube_padding,
+                part=args.cube_part,
+                nthreads=args.nthreads if hasattr(args, "nthreads") else 1,
+            )
+            print(f"  ✓ Wrote {len(paths)} cube(s) → ./cubes")
 
     # --- [9] Optional: HOMO/LUMO info ---
     if occ is not None:

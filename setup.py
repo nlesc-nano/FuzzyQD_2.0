@@ -19,23 +19,31 @@ class CMakeBuild(build_ext):
 #        super().run()
 
     def build_cmake(self, ext: CMakeExtension):
+        # NEW: Get the full path to the expected build artifact
+        ext_path = self.get_ext_fullpath(ext.name)
+    
+        # NEW: Check if the file already exists to skip recompilation
+        if os.path.exists(ext_path):
+            print(f"Skipping build: {ext_path} already exists.")
+            return
+    
         cfg = "Debug" if self.debug else "Release"
         build_temp = pathlib.Path(self.build_temp)
         build_temp.mkdir(parents=True, exist_ok=True)
-
-        extdir = pathlib.Path(self.get_ext_fullpath(ext.name)).parent.resolve()
+    
+        extdir = pathlib.Path(ext_path).parent.resolve() # Modified this line to use the path variable
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
             f"-DCMAKE_BUILD_TYPE={cfg}",
         ]
-
+    
         conda_prefix = os.environ.get("CONDA_PREFIX")
         if conda_prefix:
             cmake_args.append(f"-DCMAKE_PREFIX_PATH={conda_prefix}")
-
+    
         subprocess.check_call(["cmake", ext.sourcedir] + cmake_args, cwd=build_temp)
         subprocess.check_call(["cmake", "--build", "."], cwd=build_temp)
-
+    
 setup(
     name="FuzzyQD-2",
     version="2.0.1",

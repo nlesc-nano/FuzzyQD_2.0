@@ -215,5 +215,67 @@ PYBIND11_MODULE(libint_fuzzy, m)
           py::arg("shells"), py::arg("kpoints"), py::arg("nthreads")=1,
           "Complex AO Fourier transforms (keeps phase)");
 
+    // Evaluate AO values on arbitrary points (bohr)
+    m.def("eval_ao_points",
+      [](py::list py_shells, py::array_t<double> pts, int nthreads){
+        auto shells = convert_shells(py_shells);
+        // pts: shape (N,3)
+        auto buf = pts.unchecked<2>();
+        if (buf.shape(1) != 3) throw std::runtime_error("points must be (N,3)");
+        std::vector<Eigen::Vector3d> P; P.reserve(buf.shape(0));
+        for (ssize_t i=0;i<buf.shape(0);++i)
+          P.emplace_back(buf(i,0), buf(i,1), buf(i,2));
+    
+        libint2::initialize();
+        Eigen::MatrixXd A = licpp::ao_values_at_points(shells, P, nthreads);
+        libint2::finalize();
+        return A; // (nao, N) → NumPy float64
+      },
+      py::arg("shells"), py::arg("points"), py::arg("nthreads")=1,
+      "AO values (pure/spherical) at arbitrary grid points (bohr).");
+
+    m.def("project_mos_points",
+      [](py::list py_shells,
+         py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> Csub,
+         py::array_t<double, py::array::c_style | py::array::forcecast> pts,
+         std::string part, int nthreads) {
+    
+        auto shells = convert_shells(py_shells);
+    
+        // Csub: (nao, nm)
+        if (Csub.ndim() != 2) throw std::runtime_error("Csub must be 2D (nao,nm)");
+        const ssize_t nao = Csub.shape(0), nm = Csub.shape(1);
+        Eigen::MatrixXcd C(nao, nm);
+        auto Cbuf = Csub.unchecked<2>();
+        for (ssize_t i=0;i<nao;++i)
+          for (ssize_t j=0;j<nm;++j)
+            C(i,j) = Cbuf(i,j);
+    
+        // pts: (N,3)
+        if (pts.ndim() != 2 || pts.shape(1) != 3)
+          throw std::runtime_error("points must be shape (N,3)");
+        auto pbuf = pts.unchecked<2>();
+        std::vector<Eigen::Vector3d> P; P.reserve(pts.shape(0));
+        for (ssize_t i=0;i<pts.shape(0);++i)
+          P.emplace_back(pbuf(i,0), pbuf(i,1), pbuf(i,2));
+    
+        libint2::initialize();
+        Eigen::MatrixXd Psi = licpp::project_mos_at_points(shells, C, P, part, nthreads);
+        libint2::finalize();
+    
+        // Return (nm, N) float64
+        py::array_t<double> out({(ssize_t)Psi.rows(), (ssize_t)Psi.cols()});
+        auto obuf = out.mutable_unchecked<2>();
+        for (ssize_t i=0;i<obuf.shape(0);++i)
+          for (ssize_t j=0;j<obuf.shape(1);++j)
+            obuf(i,j) = Psi(i,j);
+        return out;
+      },
+      py::arg("shells"),
+      py::arg("Csub"),
+      py::arg("points"),
+      py::arg("part") = "real",
+      py::arg("nthreads") = 1,
+      "Project a set of MOs on arbitrary points (bohr): returns (nm, N) real matrix with selected 'part'.");
 
 }

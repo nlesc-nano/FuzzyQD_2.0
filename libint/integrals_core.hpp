@@ -55,5 +55,22 @@ namespace licpp
 
     Eigen::MatrixXcd ao_ft_complex(const std::vector<libint2::Shell>&,
                                    const std::vector<KPoint>&, int nthreads);
-      
+
+    // Evaluate AO values for all shells at arbitrary points (bohr).
+    // Returns A of shape (nao, npts).
+    Eigen::MatrixXd ao_values_at_points(
+        const std::vector<libint2::Shell>& shells,
+        const std::vector<Eigen::Vector3d>& points,
+        int nthreads);
+    
+    // Project a subset of MOs on arbitrary points (bohr).
+    // Csub is (nao, nm), possibly complex. Returns Psi (nm, npts) real,
+    // already post-processed by 'part' = "real"|"imag"|"abs"|"abs2".
+    Eigen::MatrixXd project_mos_at_points(
+        const std::vector<libint2::Shell>& shells,
+        const Eigen::MatrixXcd& Csub,
+        const std::vector<Eigen::Vector3d>& points,
+        const std::string& part,
+        int nthreads);
+    
 } // namespace licpp
