@@ -69,6 +69,13 @@ def get_args():
     parser.add_argument("-scaled_vmin", type=float, default=None,
                         help="Optional scaled vmin for intensity plot.")
 
+    # --- Analysis ---
+    parser.add_argument("--dos", action="store_true", help="Enable DOS and PDOS calculation.")
+    parser.add_argument("--pdos_atoms", nargs='+', type=str, help="List of atom symbols for PDOS (e.g., Hg Te), or 'all'.")
+    parser.add_argument("--coop", nargs='+', type=str, help="List of atom pairs for COOP (e.g., Hg-Te), or 'all'.")
+    parser.add_argument("--population_analysis", type=str, default="mulliken", choices=["mulliken", "lowdin"],
+                        help="Population analysis method for PDOS and COOP.")
+
     # Threading / BLAS control
     parser.add_argument("--no_thread_autoset", action="store_true",
         help="Do not auto-configure OpenMP/BLAS threads; use the environment as-is.")
@@ -88,4 +95,3 @@ def get_args():
     
     args = parser.parse_args()
     return args
-
