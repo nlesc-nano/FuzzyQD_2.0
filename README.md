@@ -16,13 +16,13 @@
 
 ## ⚙️ Requirements
 
-- **Python**: >= 3.9
-- **Conda** (Miniconda or Anaconda, with conda-forge channel)
-- **C/C++ compilers**: via the `compilers` metapackage (conda-forge)
-- **CMake**: >= 3.22
-- **libint**: >= 2.6 (conda-forge)
-- **Boost**: (conda-forge)
-- **pybind11**, **numpy**, **scipy**, **matplotlib**, **pymatgen**, **seekpath**
+- **Python**: >= 3.9  
+- **Conda** (Miniconda or Anaconda, with conda-forge channel)  
+- **C/C++ compilers**: via the `compilers` metapackage (conda-forge)  
+- **CMake**: >= 3.22  
+- **libint**: >= 2.6 (conda-forge)  
+- **Boost**: (conda-forge)  
+- **pybind11**, **numpy**, **scipy**, **matplotlib**, **pymatgen**, **seekpath**  
 
 The recommended way is to use the provided `environment.yml`.
 
@@ -51,11 +51,145 @@ conda activate fuzzyqd2
 ```bash
 pip install .
 ```
+
 or for development (editable install):
 
 ```bash
 pip install -e .
 ```
+
+---
+
+## 📖 Tutorial: Preparing MOs from CP2K
+
+To generate the MO coefficients needed for **FuzzyQD 2.0**, follow these steps:
+
+### 1. Run a single-point calculation in CP2K
+
+After geometry optimization, perform a **single-point calculation** with the following SCF block:
+
+```fortran
+&SCF
+  MAX_SCF 25
+  EPS_SCF 1.0E-3
+  ADDED_MOS 10000
+  SCF_GUESS RESTART
+#  &OT
+#    MINIMIZER DIIS
+#    N_DIIS 7
+#    PRECONDITIONER FULL_SINGLE_INVERSE
+#  &END OT
+&END SCF
+```
+
+⚠️ **Important**:  
+- Do **not** run OT calculations here.  
+- `ADDED_MOS` must cover at least the number of LUMOs you want to include in the fuzzy band structure.
+
+### 2. Print MOs to file
+
+Add the following to your CP2K input:
+
+```fortran
+&PRINT
+  &MO
+    &EACH
+      QS_SCF 100
+    &END
+    COEFFICIENTS
+    MO_INDEX_RANGE 1085 6941
+    NDIGITS 16
+    ADD_LAST NUMERIC
+    FILENAME MOs
+  &END
+&END PRINT
+```
+
+- `MO_INDEX_RANGE` should include **all occupied and unoccupied MOs** needed for the fuzzy band structure.  
+- `ADDED_MOS` must be **≥ number of LUMOs** in `MO_INDEX_RANGE`.  
+
+### 3. Clean the MOs file
+
+After the run, clean the `MOs.txt` file to remove headers and redundant information.
+
+For **RKS (closed-shell)**:
+
+```bash
+#!/bin/bash
+INPUT="MOs.txt"
+OUTPUT="MOs_cleaned.txt"
+
+awk '
+  BEGIN { skip=0; count=0 }
+  /EIGENVALUES/ {
+    count++
+    if (count == 1) { skip=1; next }
+    else if (count == 2) { skip=0; next }
+  }
+  skip == 0 { print }
+' "$INPUT" | \
+sed 's/MO|/ /g' | \
+grep -v -E '^[[:space:]]*$' | \
+grep -v 'E(Fermi)' | \
+grep -v 'Band gap' > "$OUTPUT"
+
+echo "✅ Cleaned file written to: $OUTPUT"
+```
+
+For **UKS (open-shell)**:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+INPUT="${1:-MOs.txt}"
+ALPHA_RAW="MOs_alpha_raw.txt"
+BETA_RAW="MOs_beta_raw.txt"
+ALPHA_OUT="MOs_alpha.txt"
+BETA_OUT="MOs_beta.txt"
+
+awk '
+  BEGIN { section=0 }
+  /^[[:space:]]*MO\|[[:space:]]*[Aa][Ll][Pp][Hh][Aa]/ { section=1; print > a; next }
+  /^[[:space:]]*MO\|[[:space:]]*[Bb][Ee][Tt][Aa]/ { section=2; print > b; next }
+  section==1 { print > a }
+  section==2 { print > b }
+' a="$ALPHA_RAW" b="$BETA_RAW" "$INPUT"
+
+clean_mos() {
+  local IN="$1"
+  local OUT="$2"
+  sed 's/MO|/ /g' "$IN" \
+    | grep -viE "alpha|beta" \
+    | grep -v -E "^[[:space:]]*$" \
+    | grep -v "E(Fermi)" \
+    | grep -v "Band gap" > "$OUT"
+}
+
+if [ -s "$ALPHA_RAW" ]; then
+  clean_mos "$ALPHA_RAW" "$ALPHA_OUT"
+else
+  echo "Warning: no ALPHA section found in $INPUT" >&2
+  : > "$ALPHA_OUT"
+fi
+
+if [ -s "$BETA_RAW" ]; then
+  clean_mos "$BETA_RAW" "$BETA_OUT"
+else
+  echo "Note: no BETA section found in $INPUT" >&2
+  : > "$BETA_OUT"
+fi
+
+rm -f "$ALPHA_RAW" "$BETA_RAW"
+
+echo "Alpha MOs written to: $ALPHA_OUT"
+echo "Beta  MOs written to: $BETA_OUT"
+```
+
+### 4. First-time use
+
+The first time you run `fuzzy2` with an MO text file, reading may be slow (depending on number of basis functions and MOs).  
+A cached `.npz` file will be created for **fast reuse** in subsequent runs.
 
 ---
 
@@ -81,64 +215,47 @@ Lattice vectors are specified as three arguments (`-A1`, `-A2`, `-A3`), each req
 | `-mo`          | Path to MO coefficients file          | `-mo MOs_cleaned.txt`          |
 | `-ewin`        | Energy window for plotting (eV)       | `-ewin -9 -3`                  |
 | `-nthreads`    | Number of threads (int, or see SLURM) | `-nthreads 8`                  |
+| `--dos`        | Compute DOS                           | `--dos`                        |
+| `--pdos_atoms` | Atoms for PDOS projection             | `--pdos_atoms all`             |
+| `--coop`       | Compute COOP                          | `--coop all`                   |
+| `-sigma_ev`    | PDOS broadening (eV)                  | `-sigma_ev 0.02`               |
+| `-scaled_vmin` | Scaling factor for fuzzy intensity    | `-scaled_vmin 1e3`             |
 
 #### Example command
 
 ```bash
-fuzzy2   -A1 0.0 3.29 3.29   -A2 3.29 0.0 3.29   -A3 3.29 3.29 0.0   -bulk_xyz bulk.xyz   -bulk_cif HgTe.cif   -xyz geom.xyz   -basis_txt BASIS_MOLOPT   -basis_name DZVP-MOLOPT-SR-GTH   -mo MOs_cleaned.txt   -ewin -9 -3   -nthreads 8
-```
-
----
-
-### Parallel and HPC Usage
-
-The script supports parallel execution by specifying `-nthreads`.  
-For HPC/Slurm jobs, you can use the SLURM environment variable:
-
-```bash
-srun fuzzy2 ... -nthreads $SLURM_CPUS_PER_TASK
-```
-
-If `-nthreads` is omitted, the script will try to use `$SLURM_CPUS_PER_TASK` or all available CPUs.
-
-#### Example Slurm script
-
-```bash
-#!/bin/bash
-#SBATCH --job-name=fuzzyqd
-#SBATCH --cpus-per-task=8
-#SBATCH --time=02:00:00
-
-source activate fuzzyqd2
-srun fuzzy2 \
-  -A1 0.0 3.29 3.29 \
-  -A2 3.29 0.0 3.29 \
-  -A3 3.29 3.29 0.0 \
-  -bulk_xyz bulk.xyz \
+fuzzy2 \
+  -A1 6.58 0.0 0.0 \
+  -A2 0.0 6.58 0.0 \
+  -A3 0.0 0.0 6.58 \
   -bulk_cif HgTe.cif \
   -xyz geom.xyz \
   -basis_txt BASIS_MOLOPT \
   -basis_name DZVP-MOLOPT-SR-GTH \
-  -mo MOs_cleaned.txt \
-  -ewin -9 -3 \
-  -nthreads $SLURM_CPUS_PER_TASK
+  -mo MOs_cleaned_csr.npz \
+  -ewin -10 -2 \
+  -sigma_ev 0.02 \
+  --dos \
+  --pdos_atoms all \
+  --coop all \
+  -scaled_vmin 1e3
 ```
 
 ---
 
 ## 📂 Input File Formats
 
-- **XYZ files**: Standard xyz atom format. First line: number of atoms.
-- **CIF files**: Standard Crystallographic Information File.
-- **BASIS/MO**: Should match the format expected by your `parsers.py`.
+- **XYZ files**: Standard xyz atom format. First line: number of atoms.  
+- **CIF files**: Standard Crystallographic Information File.  
+- **BASIS/MO**: Should match the format expected by your `parsers.py`.  
 
 ---
 
 ## 📈 Output
 
-- **Plots**: `fuzzy_band.png` is saved in the current directory.
-- **Console log**: Full progress and key calculation steps are printed.
-- **Additional files**: (k-points, tick labels) may be written if you uncomment those lines in the code.
+- **Plots**: `fuzzy_band.png` is saved in the current directory.  
+- **Console log**: Full progress and key calculation steps are printed.  
+- **Additional files**: (k-points, tick labels, DOS/PDOS/COOP) depending on flags.  
 
 ---
 
@@ -159,28 +276,24 @@ import libint_fuzzy
 ## ⚡ Troubleshooting
 
 - **`ModuleNotFoundError: libint_fuzzy`**  
-  Check that the build succeeded, and that your Python environment is activated.
+  Check that the build succeeded, and that your Python environment is activated.  
 
 - **C++/CMake errors**  
-  Make sure Boost, pybind11, and libint2 are installed via conda-forge.
+  Make sure Boost, pybind11, and libint2 are installed via conda-forge.  
 
-- **Git conflicts**  
-  If you have trouble pushing to GitHub, make sure you pulled the latest changes and resolved any merge conflicts.
+- **Slow MO reading**  
+  Use the `.npz` file generated after the first run for faster access.  
 
 ---
 
 ## 🤝 Contributing & Support
 
-- Open issues and pull requests on GitHub.
-- For questions, email [Ivan Infante](mailto:i.infante@cicnano.es) or open an issue.
-- For technical code support, you can also contact the [NLeSC Nano team](https://github.com/nlesc-nano).
+- Open issues and pull requests on GitHub.  
+- For questions, email [Ivan Infante](mailto:i.infante@cicnano.es) or open an issue.  
+- For technical code support, you can also contact the [NLeSC Nano team](https://github.com/nlesc-nano).  
 
 ---
 
 ## 📝 License
 
 This project is licensed under the MIT License (see [LICENSE](LICENSE) file).
-
----
-
-**Enjoy quantum dot band structures the easy (and fast) way!**
