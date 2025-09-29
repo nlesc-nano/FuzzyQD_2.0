@@ -36,7 +36,10 @@ def get_args():
     parser.add_argument("-A3", nargs=3, type=float, required=True,
                         metavar=("X3","Y3","Z3"), help="Lattice vector A3")
      
-    parser.add_argument("-bulk_xyz", required=True, help="Path to the periodic bulk structure in XYZ format used for the DFT calculation.")
+    parser.add_argument("-bulk_xyz", type=str, default=None,
+                   help="(Optional) Bulk structure as XYZ (Cartesian). "
+                        "If omitted, bulk is built from --bulk_cif fractional coords and A1/A2/A3.")
+
     parser.add_argument("-bulk_cif", required=True, help="Path to the bulk structure in CIF format for symmetry analysis.")
     parser.add_argument("-xyz", required=True, help="Path to the quantum dot geometry in XYZ format.")
 
@@ -91,7 +94,6 @@ def get_args():
         help="Cube margin around molecule in bohr (default 6.0).")
     parser.add_argument("--cube_part", choices=["real","imag","abs","abs2"], default="real",
         help="If MO coefficients are complex, which part to write (default real).")
-    
     
     args = parser.parse_args()
     return args

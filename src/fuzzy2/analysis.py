@@ -2,9 +2,9 @@ import numpy as np
 from scipy.linalg import eigh
 from collections import defaultdict
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm, Normalize
 
-
-# ------------------ AO helpers (expand shells -> AO arrays) ------------------
+# ------------------ AO helpers ------------------
 
 def shells_to_ao_arrays(shells):
     """
@@ -27,7 +27,6 @@ def shells_to_ao_arrays(shells):
         np.asarray(l_list, dtype=int),
     )
 
-
 # ------------------ Core building blocks ------------------
 
 def compute_pdos_weights(C, S, method="mulliken"):
@@ -40,6 +39,8 @@ def compute_pdos_weights(C, S, method="mulliken"):
     """
     if method == "lowdin":
         s_vals, s_vecs = eigh(S)
+        # guard against tiny eigenvalues
+        s_vals = np.maximum(s_vals, 1e-12)
         S_inv_sqrt = s_vecs @ np.diag(s_vals**-0.5) @ s_vecs.T
         C_prime = S_inv_sqrt @ C
         pdos_weights = np.abs(C_prime) ** 2
@@ -49,7 +50,6 @@ def compute_pdos_weights(C, S, method="mulliken"):
         which = "Mulliken"
     print(f"  ✓ PDOS weights computed using {which} population analysis.")
     return pdos_weights
-
 
 def project_pdos(pdos_weights, shells):
     """
@@ -64,13 +64,11 @@ def project_pdos(pdos_weights, shells):
     print("  ✓ PDOS projected onto atoms.")
     return projected
 
-
 # ------------------ DOS / broadening utilities ------------------
 
 def gaussian_kernel(E, eps, sigma):
     X = (E[:, None] - eps[None, :]) / sigma
     return np.exp(-0.5 * X * X) / (sigma * np.sqrt(2 * np.pi))
-
 
 def broaden(values_per_mo, energies, energy_grid, sigma):
     """
@@ -81,18 +79,15 @@ def broaden(values_per_mo, energies, energy_grid, sigma):
     G = gaussian_kernel(energy_grid, energies, sigma)  # (nE, nMO)
     return (values_per_mo * G).sum(axis=1)
 
-
 def compute_dos_states(eps, energy_grid, sigma):
     """Count-of-states DOS (occupied + unoccupied, each MO weight=1)."""
     ones = np.ones_like(eps)
     return broaden(ones, eps, energy_grid, sigma)
 
-
 def compute_dos_electrons(eps, occ, energy_grid, sigma):
     """Electron DOS (weights by occupations)."""
     w = np.asarray(occ) if occ is not None else 1.0
     return broaden(w, eps, energy_grid, sigma)
-
 
 def fermi_from_occ(eps, occ, ewin=None, tol=1e-8):
     """
@@ -107,7 +102,6 @@ def fermi_from_occ(eps, occ, ewin=None, tol=1e-8):
         return 0.5 * (ewin[0] + ewin[1])
     return float(np.median(eps))
 
-
 # ------------------ Compact, one-line analyses ------------------
 
 def _fmt0(x, eps=1e-6, nd=3):
@@ -115,8 +109,8 @@ def _fmt0(x, eps=1e-6, nd=3):
     v = 0.0 if abs(x) < eps else x
     return f"{v:.{nd}f}"
 
-
-def print_pdos_population_analysis(pdos_weights, shells, eps, occ, ewin=None, spd_thresh=0.01, include_unocc=True):
+def print_pdos_population_analysis(pdos_weights, shells, eps, occ, ewin=None,
+                                   spd_thresh=0.01, include_unocc=True):
     """
     Compact per-MO one-liners inside the energy window:
     MO <n> E=<eV> occ=<o> | <sym>=<tot> [s:<v> p:<v> d:<v> ; ...] ; <sym2>=...
@@ -157,7 +151,6 @@ def print_pdos_population_analysis(pdos_weights, shells, eps, occ, ewin=None, sp
         occ_str = f"{occ[n]:.1f}" if occ is not None else "NA"
         print(f"MO {n:4d}  E={eps[n]:8.3f} eV  occ={occ_str}  |  " + "  ;  ".join(parts))
 
-
 def compute_coop(C, S, shells, atom_pairs):
     """
     COOP weights per MO for each atom-type pair (e.g., 'Cd-Se').
@@ -191,7 +184,6 @@ def compute_coop(C, S, shells, atom_pairs):
     print(f"  ✓ COOP computed for {len(atom_pairs)} atom pairs.")
     return results
 
-
 def print_coop_analysis(coop_weights, eps, occ, ewin=None, include_unocc=True):
     """
     Compact per-MO line inside ewin:
@@ -208,7 +200,6 @@ def print_coop_analysis(coop_weights, eps, occ, ewin=None, include_unocc=True):
         parts = [f"{p}={_fmt0(coop_weights[p][n], nd=4)}" for p in pairs]
         occ_str = f"{occ[n]:.1f}" if occ is not None else "NA"
         print(f"MO {n:4d}  E={eps[n]:8.3f} eV  occ={occ_str}  |  " + "  ;  ".join(parts))
-
 
 # ------------------ Plot wrappers (original workflow preserved) ------------------
 
@@ -282,7 +273,6 @@ def plot_dos_and_pdos(eps, occ, C, S, shells, pdos_atom_list, ewin,
     plt.savefig("dos_pdos.png", dpi=150)
     print("  ✓ DOS/PDOS plot saved as dos_pdos.png")
 
-
 def plot_coop(eps, C, S, shells, coop_pair_list, ewin,
               method="mulliken", sigma=0.1):
     """
@@ -313,7 +303,7 @@ def plot_coop(eps, C, S, shells, coop_pair_list, ewin,
     plt.savefig("coop.png", dpi=150)
     print("  ✓ COOP plot saved as coop.png")
 
-from matplotlib.colors import LogNorm, Normalize
+# ------------------ Combined fuzzy+PDOS (kept for convenience) ------------------
 
 def plot_fuzzy_and_pdos_combo(
     kpts_cart,
@@ -418,9 +408,9 @@ def plot_fuzzy_and_pdos_combo(
     # ---- Draw PDOS (right-mid), hide duplicate y ----
     axR.tick_params(left=False, labelleft=False)
     axR.spines["left"].set_visible(False)
+    handles = []
     if Ycum is not None:
         prev = np.zeros_like(centres)
-        handles = []
         for j in range(Ycum.shape[1]):
             p = axR.fill_betweenx(centres, prev, Ycum[:, j], alpha=0.75, linewidth=0.0, label=labels_p[j])
             handles.append(p)
@@ -428,8 +418,8 @@ def plot_fuzzy_and_pdos_combo(
         axR.set_xlim(0.0, xmax)
         axR.set_xlabel("PDOS (a.u.)")
     else:
-        handles, labels_p = [], []
-        axR.set_xlim(0.0, 1.0); axR.set_xlabel("PDOS (a.u.)")
+        axR.set_xlim(0.0, 1.0)
+        axR.set_xlabel("PDOS (a.u.)")
 
     # ---- Legend in its own panel (never overlaps) ----
     axLeg.axis("off")
@@ -437,12 +427,208 @@ def plot_fuzzy_and_pdos_combo(
         axLeg.legend(handles, labels_p, loc="upper left", frameon=False, fontsize=9)
 
     # ---- Colorbar below the legend (same narrow info column) ----
-    # vertical colorbar aligned under axLeg
     cb = plt.colorbar(im, cax=axC, orientation='vertical')
     cb.set_label("Intensity (arb., log scale)", fontsize=9)
 
-    # tidy figure and save (no tight_layout to avoid warnings with custom axes)
     fig.savefig(outfile, dpi=300, bbox_inches="tight")
     print(f"✓ Combined fuzzy+PDOS plot saved to {outfile}")
     plt.close(fig)
+
+# ------------------ Combined fuzzy+PDOS+COOP + CSV exports ------------------
+def plot_fuzzy_pdos_coop_combo(
+    kpts_cart, labels, k_path_dist,
+    eps_eV, intensity, C, S, shells,
+    pdos_atom_list, coop_pair_list, ewin,
+    sigma_ev=0.10, sigma_pdos=0.08,       # COOP uses sticks (no σ)
+    midgap=None, occ=None,
+    outfile="fuzzy_pdos_coop.png",
+    scaled_vmin=1e-4,
+):
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
+    from matplotlib.lines import Line2D
+    from .plotting import dedup_kpath_strict, _plain_k_label, _fade_cmap
+    import csv
+    import numpy as np
+
+    # -------- Fuzzy grid (unchanged) --------
+    kpts_dedup, labels_dedup, keep = dedup_kpath_strict(np.asarray(kpts_cart), labels)
+    I = intensity[:, keep]; ncol = I.shape[1]
+    E = np.asarray(eps_eV)
+    in_win = (E >= ewin[0] - 4*sigma_ev) & (E <= ewin[1] + 4*sigma_ev)
+    E, I = E[in_win], I[in_win, :]
+
+    dE = max(0.5*sigma_ev, 0.01)
+    edges   = np.arange(ewin[0], ewin[1] + dE, dE)
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    Z = np.zeros((centres.size, ncol), dtype=float)
+    for En, Ik in zip(E, I):
+        w = np.exp(-0.5 * ((centres - En) / sigma_ev) ** 2)
+        Z += np.outer(w, Ik)
+
+    vmax = np.percentile(Z, 99.9) if np.any(Z > 0) else 1.0
+    pos  = Z[Z > 0]; vmin = np.percentile(pos, 5) if pos.size else 1e-6
+    vmin_eff = max(vmin, vmax/float(scaled_vmin))
+    if vmin_eff >= vmax: vmin_eff = max(vmax * 0.5, 1e-8)
+    norm = mcolors.LogNorm(vmin=vmin_eff, vmax=vmax)
+    cmap = _fade_cmap(); cmap.set_bad('black'); cmap.set_under('black')
+
+    # -------- PDOS (unchanged) --------
+    pdos_weights = compute_pdos_weights(C, S, method="mulliken")
+    projected = project_pdos(pdos_weights, shells)
+    atom_idx_shell = np.array([int(sh["atom_idx"]) for sh in shells], dtype=int)
+    sym_shell      = np.array([sh["sym"] for sh in shells], dtype=object)
+    sym_to_atom_indices = {sym: np.unique(atom_idx_shell[sym_shell == sym]) for sym in set(sym_shell)}
+
+    curves_p, labels_p = [], []
+    for sym in pdos_atom_list:
+        rows = sym_to_atom_indices.get(sym, np.array([], dtype=int))
+        if rows.size == 0: continue
+        w_mo = projected[rows, :].sum(axis=0)
+        curves_p.append(broaden(w_mo, eps_eV, centres, sigma_pdos))
+        labels_p.append(sym)
+    Ycum = np.cumsum(np.column_stack(curves_p), axis=1) if curves_p else None
+
+    # -------- COOP: keep only direct bonds Hg–Te and Hg–Cl (order-insensitive) --------
+    def _canonical_pair(p):
+        a, b = [s.strip() for s in p.split("-")]
+        return "-".join(sorted((a, b)))
+
+    allowed_sets = {frozenset(("Hg", "Te")), frozenset(("Hg", "Cl"))}
+    pairs_canon = []
+    for p in coop_pair_list:
+        a, b = [s.strip() for s in p.split("-")]
+        if a == b:  # skip A–A
+            continue
+        if frozenset((a, b)) in allowed_sets:
+            pairs_canon.append(_canonical_pair(p))
+
+    # deduplicate while preserving order
+    pairs_unique = []
+    seen = set()
+    for p in pairs_canon:
+        if p not in seen:
+            seen.add(p); pairs_unique.append(p)
+
+    # compute COOP only for the filtered pairs
+    coop_weights = compute_coop(C, S, shells, pairs_unique)
+
+    # energies to draw sticks (within window)
+    E_all = np.asarray(eps_eV)
+    mask_sticks = (E_all >= ewin[0]) & (E_all <= ewin[1])
+    Ener_sticks = E_all[mask_sticks]
+
+    # fixed color map for COOP (distinct from PDOS’ blue/orange/green)
+    coop_color_map = {
+        "Hg-Cl": "#b15928",  # brown
+        "Hg-Te": "#7b1fa2",  # purple
+    }
+
+    ef = (fermi_from_occ(eps_eV, occ, ewin) if midgap is None else float(midgap))
+
+    # -------- Layout --------
+    fig = plt.figure(figsize=(12, 5.4), constrained_layout=False)
+    gs  = GridSpec(1, 120, figure=fig, wspace=0.05)
+    axF = fig.add_subplot(gs[0, :70])                # fuzzy
+    axP = fig.add_subplot(gs[0, 70:85],  sharey=axF) # PDOS
+    axC = fig.add_subplot(gs[0, 85:100], sharey=axF) # COOP sticks
+    infoS = GridSpecFromSubplotSpec(2, 1, subplot_spec=gs[0, 100:], height_ratios=[3, 2], hspace=0.15)
+    axLeg = fig.add_subplot(infoS[0])                # legend
+    axBar = fig.add_subplot(infoS[1])                # colorbar
+
+    # Fuzzy
+    extent = [0, ncol-1, centres.min(), centres.max()]
+    im = axF.imshow(Z, origin='lower', aspect='auto', extent=extent, cmap=cmap, norm=norm)
+    axF.set_facecolor('black'); axF.set_ylim(ewin)
+    axF.set_ylabel("Energy (eV)"); axF.set_xlabel("High-Symmetry k-Path")
+    tick_pos, tick_lab, prev = [], [], None
+    for i, lbl in enumerate(labels_dedup):
+        if lbl and lbl != prev:
+            tick_pos.append(float(i)); tick_lab.append(_plain_k_label(lbl))
+            axF.axvline(i, color='gray', lw=0.5, alpha=0.6); prev = lbl
+    axF.set_xticks(tick_pos); axF.set_xticklabels(tick_lab)
+    axF.axhline(ef, color='w', ls='--', lw=1.2, alpha=0.9)
+
+    # PDOS
+    axP.tick_params(left=False, labelleft=False); axP.spines["left"].set_visible(False)
+    handles_p = []
+    if Ycum is not None:
+        prev = np.zeros_like(centres)
+        for j in range(Ycum.shape[1]):
+            p = axP.fill_betweenx(centres, prev, Ycum[:, j], alpha=0.75, linewidth=0.0, label=labels_p[j])
+            handles_p.append(p); prev = Ycum[:, j]
+        axP.set_xlim(0, float(Ycum.max())*1.05); axP.set_xlabel("PDOS")
+    else:
+        axP.set_xlim(0, 1); axP.set_xlabel("PDOS")
+
+    # COOP sticks: plot both allowed pairs with semi-transparency; weakest → strongest
+    axC.tick_params(left=False, labelleft=False); axC.spines["left"].set_visible(False)
+    axC.axvline(0, lw=0.8, color="k", alpha=0.7); axC.set_xlabel("COOP")
+
+    # order by max magnitude to mitigate overdraw
+    pair_max = {p: (np.max(np.abs(np.asarray(coop_weights.get(p, [0]))[mask_sticks]))
+                    if Ener_sticks.size else 0.0)
+                for p in pairs_unique}
+    order = sorted(pairs_unique, key=lambda p: pair_max[p])  # weakest first
+
+    coop_handles = []
+    x_max = 0.0
+    for p in order:
+        vals = np.asarray(coop_weights.get(p))
+        if Ener_sticks.size == 0 or vals.size == 0: continue
+        vV  = vals[mask_sticks]
+        col = coop_color_map.get(p, "#555555")
+        axC.hlines(Ener_sticks, 0.0, vV, colors=col, linewidths=1.1, alpha=0.65)
+        x_max = max(x_max, np.max(np.abs(vV)))
+        coop_handles.append(Line2D([0],[0], color=col, lw=2, label=f"{p} (+/−)"))
+    axC.set_xlim(-x_max*1.05 if x_max>0 else -1.0, x_max*1.05 if x_max>0 else 1.0)
+
+    # Legends + slimmer colorbar
+    axLeg.axis("off")
+    all_handles = handles_p + coop_handles
+    all_labels  = ([h.get_label() for h in handles_p] +
+                   [h.get_label() for h in coop_handles])
+    if all_handles:
+        axLeg.legend(all_handles, all_labels, loc="upper left", frameon=False, fontsize=9)
+
+    cb = plt.colorbar(im, cax=axBar, orientation='vertical')
+    cb.set_label("Intensity (arb., log scale)", fontsize=9)
+    # make colorbar a bit narrower
+    bbox = axBar.get_position()
+    axBar.set_position([bbox.x0 + 0.35*bbox.width, bbox.y0, 0.55*bbox.width, bbox.height])
+
+    fig.savefig(outfile, dpi=300, bbox_inches="tight")
+    print(f"✓ Combined fuzzy+PDOS+COOP plot saved to {outfile}")
+    plt.close(fig)
+
+    # ---- CSV exports (fuzzy & PDOS unchanged; COOP exports sticks for filtered pairs) ----
+    # fuzzy
+    with open("fuzzy_data.csv", "w", newline="") as fh:
+        import csv; w = csv.writer(fh)
+        w.writerow(["Energy_eV","k_index","Fuzzy_Intensity"])
+        for iE, E in enumerate(centres):
+            for ik in range(ncol):
+                w.writerow([E, ik, Z[iE, ik]])
+    print("  ✓ Exported fuzzy → fuzzy_data.csv")
+
+    # pdos
+    if Ycum is not None and len(labels_p) > 0:
+        with open("pdos_data.csv", "w", newline="") as fh:
+            import csv; w = csv.writer(fh)
+            w.writerow(["Energy_eV"] + labels_p)
+            for iE, E in enumerate(centres):
+                row = [E] + [Ycum[iE, j] for j in range(len(labels_p))]
+                w.writerow(row)
+        print("  ✓ Exported PDOS → pdos_data.csv")
+
+    # coop sticks
+    if len(pairs_unique) > 0 and Ener_sticks.size > 0:
+        with open("coop_data.csv", "w", newline="") as fh:
+            import csv; w = csv.writer(fh)
+            w.writerow(["MO_Energy_eV"] + pairs_unique)
+            cols = [np.asarray(coop_weights[p])[mask_sticks] for p in pairs_unique]
+            for i in range(Ener_sticks.size):
+                w.writerow([Ener_sticks[i]] + [cols[j][i] for j in range(len(cols))])
+        print("  ✓ Exported COOP (sticks) → coop_data.csv")
 

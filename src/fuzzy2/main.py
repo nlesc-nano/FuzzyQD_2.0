@@ -68,15 +68,31 @@ def main():
 
     # --- [3] Build the DFT Structure for K-Path Generation ---
     print("\n--- [3] Building DFT cell structure for k-path ---")
-    syms_bulk_dft, coords_bulk_dft = io_utils.read_xyz(args.bulk_xyz)
+    lat_dft = Lattice(user_lattice)  # rows are A1,A2,A3 (Å)
 
-    lat_dft = Lattice(user_lattice)
-    struct_dft = Structure(
-        lattice=lat_dft,
-        species=syms_bulk_dft,
-        coords=coords_bulk_dft,
-        coords_are_cartesian=True,
-    )
+    if getattr(args, "bulk_xyz", None):
+        # Backward-compatible path: user-supplied Cartesian XYZ
+        syms_bulk_dft, coords_bulk_dft = io_utils.read_xyz(args.bulk_xyz)
+        struct_dft = Structure(
+            lattice=lat_dft,
+            species=syms_bulk_dft,
+            coords=coords_bulk_dft,
+            coords_are_cartesian=True,
+        )
+        print("  ✓ Using bulk XYZ provided on CLI.")
+    else:
+        # New default: build from CIF fractional coords + user lattice
+        # We already standardized the CIF → use its conventional cell fractional sites
+        struct_ref = struct_cif_conv
+        struct_dft = Structure(
+            lattice=lat_dft,
+            species=list(struct_ref.species),
+            coords=struct_ref.frac_coords,
+            coords_are_cartesian=False,
+        )
+        # Keep atoms inside cell to avoid tiny negative fracs carrying over
+        struct_dft = Structure.from_sites([s.to_unit_cell() for s in struct_dft.sites])
+        print("  ✓ Built bulk from CIF fractional coords and A1/A2/A3.")
 
     # Standardize the DFT structure
     struct_dft_prim = SpacegroupAnalyzer(struct_dft).get_primitive_standard_structure()
@@ -251,23 +267,45 @@ def main():
 
         # --- [9.5] Combined fuzzy + PDOS figure (shared energy axis) ---
         try:
-            analysis.plot_fuzzy_and_pdos_combo(
-                kpts_cart=kpts_cart,
-                labels=labels,
-                k_path_dist=k_path_dist,
-                eps_eV=eps_eV,
-                occ=occ,                           # now accepted
-                intensity=intensity,
-                C=C_like, S=S, shells=shells,
-                pdos_atom_list=pdos_atom_list,
-                ewin=args.ewin,
-                sigma_ev=(args.sigma_ev or 0.10),
-                sigma_pdos=0.08,
-                midgap=midgap,
-                scaled_vmin=args.scaled_vmin,
-                outfile="fuzzy_plus_pdos.png",
-            )
-
+            # --- [8b] Combined panels on demand ---
+            if args.dos and args.coop:
+                # 3-panel: fuzzy + PDOS + COOP (shared y-axis, legends + colorbar on far right)
+                coop_pair_list = ([f"{a}-{b}" for a in sorted(set(syms_qd)) for b in sorted(set(syms_qd)) if a != b]
+                                  if args.coop == ["all"] else args.coop)
+                pdos_atom_list = (sorted(set(syms_qd)) if args.pdos_atoms == ["all"] else args.pdos_atoms)
+            
+                analysis.plot_fuzzy_pdos_coop_combo(
+                    kpts_cart, labels, k_path_dist,
+                    eps_eV, intensity,
+                    C_like, S, shells,
+                    pdos_atom_list=pdos_atom_list,
+                    coop_pair_list=coop_pair_list,
+                    ewin=args.ewin,
+                    sigma_ev=args.sigma_ev,
+                    sigma_pdos=0.08,      # keep PDOS σ independent of fuzzy
+                    midgap=midgap,
+                    occ=occ,
+                    outfile="fuzzy_pdos_coop.png",
+                    scaled_vmin=args.scaled_vmin,
+                )
+            elif args.dos:
+                # 2-panel: fuzzy + PDOS (backward compatible)
+                pdos_atom_list = (sorted(set(syms_qd)) if args.pdos_atoms == ["all"] else args.pdos_atoms)
+                analysis.plot_fuzzy_and_pdos_combo(
+                    kpts_cart, labels, k_path_dist,
+                    eps_eV, intensity,
+                    C_like, S, shells,
+                    pdos_atom_list=pdos_atom_list,
+                    ewin=args.ewin,
+                    sigma_ev=args.sigma_ev,
+                    sigma_pdos=0.08,
+                    midgap=midgap,
+                    occ=occ,
+                    outfile="fuzzy_plus_pdos.png",
+                    scaled_vmin=args.scaled_vmin,
+                )
+            # else: no combined side-panels requested
+            
         except Exception as e:
             print(f"  ⚠︎ Combined fuzzy+PDOS plot failed: {e}")
 
