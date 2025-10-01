@@ -40,16 +40,21 @@ def compute_pdos_weights(C, S, method="mulliken"):
     C: (nAO, nMO), S: (nAO, nAO)
     Returns: (nAO, nMO)
     """
+    # --- Ensure columns of C are S-orthonormal: c_k^H S c_k = 1 ---
+    norms = (C.conj() * (S @ C)).sum(axis=0).real
+    scale = 1.0 / np.sqrt(np.maximum(norms, 1e-12))
+    Cn = C * scale  # column-wise scaled copy
+
     if method == "lowdin":
         s_vals, s_vecs = eigh(S)
-        # guard against tiny eigenvalues
-        s_vals = np.maximum(s_vals, 1e-12)
+        s_vals = np.maximum(s_vals, 1e-12)  # guard against tiny eigenvalues
         S_inv_sqrt = s_vecs @ np.diag(s_vals**-0.5) @ s_vecs.T
-        C_prime = S_inv_sqrt @ C
+        C_prime = S_inv_sqrt @ Cn
         pdos_weights = np.abs(C_prime) ** 2
         which = "Löwdin"
     else:
-        pdos_weights = (C.conj() * (S @ C)).real
+        # Mulliken with S-orthonormalized MOs
+        pdos_weights = (Cn.conj() * (S @ Cn)).real
         which = "Mulliken"
     print(f"  ✓ PDOS weights computed using {which} population analysis.")
     return pdos_weights
@@ -302,6 +307,86 @@ def _prepare_fuzzy_map(kpts_cart, labels, intensity, eps_eV, ewin,
         energy_window=(float(ewin[0]), float(ewin[1])),
     )
 
+
+# ------------------ Bond detection + colors ------------------
+
+# Fallback covalent radii in Å (used if periodictable is not available)
+_COV_FALLBACK = {
+    "H":0.31,"C":0.76,"N":0.71,"O":0.66,"F":0.57,"Cl":0.99,"Br":1.14,"I":1.33,
+    "Na":1.66,"K":2.03,"Rb":2.16,"Cs":2.35,
+    "Cd":1.44,"Hg":1.32,"Te":1.38,"Pb":1.44,"Se":1.20
+}
+
+def covalent_radius(sym: str) -> float:
+    try:
+        import periodictable as pt
+        return float(pt.elements.symbol(sym).covalent_radius)
+    except Exception:
+        return _COV_FALLBACK.get(sym, 1.2)
+
+def bonded_symbol_pairs_from_overlap(S, shells, s_thresh: float = 0.05):
+    """
+    Infer which symbol pairs (e.g., 'Hg-Te') are directly bonded by testing if
+    any AO pair across two symbols has |S_ij| >= s_thresh.
+    """
+    _, sym_ao, _ = shells_to_ao_arrays(shells)
+    sym_to_idx = {sym: np.where(sym_ao == sym)[0] for sym in set(sym_ao)}
+    symbols = sorted(sym_to_idx.keys())
+
+    bonded = set()
+    for i, a in enumerate(symbols):
+        Ai = sym_to_idx[a]
+        for b in symbols[i+1:]:
+            Bi = sym_to_idx[b]
+            if Ai.size == 0 or Bi.size == 0:
+                continue
+            Sab = S[np.ix_(Ai, Bi)]
+            if Sab.size and (np.abs(Sab) >= s_thresh).any():
+                bonded.add("-".join(sorted((a,b))))
+    return sorted(bonded)
+
+def bonded_symbol_pairs_from_distance(atom_symbols, positions, scale: float = 1.15):
+    """
+    Return symbol pairs that are bonded by distance criterion:
+    min distance between any atom of A and B < scale*(rcov(A)+rcov(B)).
+    """
+    import numpy as np
+    atom_symbols = np.asarray(atom_symbols, dtype=object)
+    R = np.asarray(positions, float)
+    n = len(atom_symbols)
+
+    # group atom indices by symbol
+    from collections import defaultdict
+    idx_by_sym = defaultdict(list)
+    for i, s in enumerate(atom_symbols):
+        idx_by_sym[str(s)].append(i)
+    syms = sorted(idx_by_sym.keys())
+
+    bonded = set()
+    for i, a in enumerate(syms):
+        Ai = np.array(idx_by_sym[a], int)
+        for b in syms[i+1:]:
+            Bi = np.array(idx_by_sym[b], int)
+            if Ai.size == 0 or Bi.size == 0: continue
+            Ra, Rb = R[Ai], R[Bi]
+            # pairwise distances
+            d2 = np.sum((Ra[:,None,:]-Rb[None,:,:])**2, axis=2)
+            dmin = float(np.sqrt(d2.min()))
+            cutoff = scale*(covalent_radius(a) + covalent_radius(b))
+            if dmin < cutoff:
+                bonded.add("-".join(sorted((a,b))))
+    return sorted(bonded)
+
+def pair_color_map(pairs: List[str]):
+    """
+    Deterministic color assignment for a given ordered list of pairs,
+    using Matplotlib's current prop cycle so standalone and combo match.
+    """
+    cycle = plt.rcParams['axes.prop_cycle'].by_key().get('color', ["#4c72b0","#dd8452","#55a868","#c44e52","#8172b3","#937860"])
+    cmap = {}
+    for i, p in enumerate(pairs):
+        cmap[p] = cycle[i % len(cycle)]
+    return cmap
 # ------------------ Plot wrappers (original workflow preserved) ------------------
 
 def plot_dos_and_pdos(eps, occ, C, S, shells, pdos_atom_list, ewin,
@@ -315,10 +400,8 @@ def plot_dos_and_pdos(eps, occ, C, S, shells, pdos_atom_list, ewin,
     print("\n--- [Plotting DOS/PDOS] ---")
     energy_grid = np.linspace(ewin[0], ewin[1], 1000)
 
-    # Count-of-states DOS (shows LUMOs too)
-    dos_states = compute_dos_states(eps, energy_grid, sigma)
-
-    # PDOS weights and atom-projected (nAtoms, nMO)
+    # Build PDOS curves
+# PDOS weights and atom-projected (nAtoms, nMO)
     _, projected, sym_to_atom_indices = _prepare_pdos_data(C, S, shells, method=method)
 
     # Build per-symbol PDOS curves (NO occupation weighting → include LUMOs)
@@ -342,15 +425,18 @@ def plot_dos_and_pdos(eps, occ, C, S, shells, pdos_atom_list, ewin,
         plt.fill_between(energy_grid, prev, Ycum[:, j], alpha=0.75, linewidth=0.0, label=labels[j])
         prev = Ycum[:, j]
     # Overlay thin total DOS
-    plt.plot(energy_grid, dos_states, lw=1.1, color="k", alpha=0.9, label="Total DOS")
+    
+    # Black "Total DOS" as the sum of the plotted PDOS curves (ensures identity)
+    total_curve = Ycum[:, -1] if Ycum is not None and Ycum.ndim == 2 else np.zeros_like(energy_grid)
+    plt.plot(energy_grid, total_curve, lw=1.1, color="k", alpha=0.9, label="Total DOS")
 
     # Midgap (Fermi-like) vertical line
     ef = fermi_from_occ(eps, occ, ewin)
     plt.axvline(ef, color="k", ls="--", lw=1.0, alpha=0.8)
-    plt.text(ef, 0.98 * max(Ycum.max(), dos_states.max()), " $E_F$", ha="left", va="top")
+    plt.text(ef, 0.98 * float(max(Ycum.max(), total_curve.max() if np.ndim(total_curve)>0 else total_curve)), " $E_F$", ha="left", va="top")
 
     plt.xlim(ewin[0], ewin[1])
-    ymax = max(Ycum.max(), dos_states.max()) * 1.05
+    ymax = max(Ycum.max(), (total_curve.max() if np.ndim(total_curve)>0 else float(total_curve))) * 1.05
     plt.ylim(0.0, ymax if ymax > 0 else 1.0)
     plt.xlabel("Energy (eV)")
     plt.ylabel("DOS (a.u.)")
@@ -361,35 +447,87 @@ def plot_dos_and_pdos(eps, occ, C, S, shells, pdos_atom_list, ewin,
     print("  ✓ DOS/PDOS plot saved as dos_pdos.png")
 
 def plot_coop(eps, C, S, shells, coop_pair_list, ewin,
-              method="mulliken", sigma=0.1):
+              method="mulliken", sigma=0.1,
+              normalize=True, bond_mode="distance", s_thresh=0.05,
+              atom_symbols=None, positions=None, bond_scale=1.05):
     """
     Make 'coop.png' with COOP curves for selected pairs (filled pos/neg lobes).
+    If normalize=True, scales to [-1, 1].
+    If bond_mode in {"overlap","distance"}, filter pairs to actually bonded.
+      - "overlap": uses AO overlap threshold s_thresh.
+      - "distance": requires atom_symbols + positions to detect bonds by covalent radii.
+    If coop_pair_list is None, discover all bonded pairs under the chosen mode.
     """
     print("\n--- [Plotting COOP] ---")
     energy_grid = np.linspace(ewin[0], ewin[1], 1000)
-    coop_weights = compute_coop(C, S, shells, coop_pair_list)
+
+    # Decide which pairs to plot
+    def canon(p):
+        a,b = [t.strip() for t in p.split("-")]
+        return "-".join(sorted((a,b)))
+
+    if bond_mode == "distance" and (atom_symbols is not None and positions is not None):
+        bonded = set(bonded_symbol_pairs_from_distance(atom_symbols, positions, scale=bond_scale))
+    elif bond_mode == "overlap":
+        bonded = set(bonded_symbol_pairs_from_overlap(S, shells, s_thresh=s_thresh))
+    else:
+        bonded = None  # accept all
+
+    if coop_pair_list is None:
+        pairs = sorted(bonded) if bonded is not None else []
+    else:
+        pairs = []
+        seen=set()
+        for p in coop_pair_list:
+            cp = canon(p)
+            if bonded is not None and cp not in bonded:
+                continue
+            if cp not in seen:
+                seen.add(cp); pairs.append(cp)
+
+    coop_weights = compute_coop(C, S, shells, pairs)
+
+
+
+    # Colors shared between standalone and combo
+    cmap = pair_color_map(pairs)
 
     plt.figure(figsize=(7.0, 4.4))
-    for pair in coop_pair_list:
+    curves = {}
+    for pair in pairs:
         vals = coop_weights.get(pair)
-        if vals is None:
+        if vals is None: 
             continue
         curve = broaden(vals, eps, energy_grid, sigma)
+        curves[pair] = curve
+
+    # Normalize to [-1,1] if requested
+    if normalize and curves:
+        m = max(float(np.max(np.abs(v))) for v in curves.values() if v.size)
+        if m > 0:
+            for k in list(curves.keys()):
+                curves[k] = np.clip(curves[k]/m, -1.0, 1.0)
+
+    for pair, curve in curves.items():
         pos = np.clip(curve, 0, None)
         neg = np.clip(curve, None, 0)
-        plt.fill_between(energy_grid, 0, pos, alpha=0.5, label=f"{pair} (+)")
-        plt.fill_between(energy_grid, 0, neg, alpha=0.5, label=f"{pair} (−)")
+        col = cmap.get(pair, None)
+        plt.fill_between(energy_grid, 0, pos, alpha=0.5, label=f"{pair} (+)", color=col)
+        plt.fill_between(energy_grid, 0, neg, alpha=0.5, label=f"{pair} (−)", color=col)
 
     plt.axhline(0.0, lw=0.8, color="k", alpha=0.6)
     plt.xlim(ewin[0], ewin[1])
+    if normalize:
+        plt.ylim(-1.05, 1.05)
+        plt.ylabel("COOP (normalized)")
+    else:
+        plt.ylabel("COOP (a.u.)")
     plt.xlabel("Energy (eV)")
-    plt.ylabel("COOP (a.u.)")
-    plt.title("Crystal Orbital Overlap Population (filled)")
+    plt.title("Crystal Orbital Overlap Population")
     plt.legend(ncol=2)
     plt.tight_layout()
     plt.savefig("coop.png", dpi=150)
     print("  ✓ COOP plot saved as coop.png")
-
 # ------------------ Combined fuzzy+PDOS (kept for convenience) ------------------
 
 def plot_fuzzy_and_pdos_combo(
@@ -509,19 +647,28 @@ def plot_fuzzy_pdos_coop_combo(
         projected, sym_to_atom, pdos_atom_list, eps_eV, fuzzy.centres, sigma_pdos
     )
 
-    # -------- COOP: keep only direct bonds Hg–Te and Hg–Cl (order-insensitive) --------
+    
+    # -------- COOP: select bonded pairs (distance preferred if data is available) --------
     def _canonical_pair(p):
         a, b = [s.strip() for s in p.split("-")]
         return "-".join(sorted((a, b)))
 
-    allowed_sets = {frozenset(("Hg", "Te")), frozenset(("Hg", "Cl"))}
-    pairs_canon = []
-    for p in coop_pair_list:
-        a, b = [s.strip() for s in p.split("-")]
-        if a == b:  # skip A–A
-            continue
-        if frozenset((a, b)) in allowed_sets:
-            pairs_canon.append(_canonical_pair(p))
+    # Attempt distance-based bonding if atom symbols/positions are attached to shells.
+    atom_symbols_opt = getattr(shells, "atom_symbols", None) if hasattr(shells, "__dict__") else None
+    positions_opt     = getattr(shells, "positions", None) if hasattr(shells, "__dict__") else None
+
+    if coop_pair_list is None or len(coop_pair_list) == 0:
+        if atom_symbols_opt is not None and positions_opt is not None:
+            pairs_canon = bonded_symbol_pairs_from_distance(atom_symbols_opt, positions_opt, scale=1.15)
+        else:
+            pairs_canon = bonded_symbol_pairs_from_overlap(S, shells, s_thresh=0.05)
+    else:
+        raw = [_canonical_pair(p) for p in coop_pair_list if "-" in p]
+        bonded = set(bonded_symbol_pairs_from_overlap(S, shells, s_thresh=0.05))
+        # If distance info available, refine with distance
+        if atom_symbols_opt is not None and positions_opt is not None:
+            bonded = bonded.intersection(set(bonded_symbol_pairs_from_distance(atom_symbols_opt, positions_opt, scale=1.15)))
+        pairs_canon = [p for p in raw if p in bonded]
 
     # deduplicate while preserving order
     pairs_unique = []
@@ -531,16 +678,30 @@ def plot_fuzzy_pdos_coop_combo(
             seen.add(p); pairs_unique.append(p)
 
     coop_weights = compute_coop(C, S, shells, pairs_unique)
-
+    # --- COOP energy window + normalization + colors ---
+    # 1) pick MO energies inside the plotting window
     E_all = np.asarray(eps_eV)
     mask_sticks = (E_all >= ewin[0]) & (E_all <= ewin[1])
-    Ener_sticks = E_all[mask_sticks]
+    Ener_sticks = E_all[mask_sticks] if E_all.size else np.asarray([], dtype=float)
 
-    # fixed color map for COOP (distinct from PDOS’ blue/orange/green)
-    coop_color_map = {
-        "Hg-Cl": "#b15928",  # brown
-        "Hg-Te": "#7b1fa2",  # purple
-    }
+    # 2) global normalization so sticks are in [-1, 1]
+    global_max = 0.0
+    for p in pairs_unique:
+        vals = np.asarray(coop_weights.get(p))
+        if vals is None or vals.size == 0:
+            continue
+        v = vals[mask_sticks]
+        if v.size:
+            global_max = max(global_max, float(np.max(np.abs(v))))
+    scale_norm = (1.0 / global_max) if global_max > 0 else 1.0
+
+    # 3) color map for pairs (same palette as standalone)
+    palette = plt.rcParams['axes.prop_cycle'].by_key().get(
+        'color',
+        ["#4c72b0", "#dd8452", "#55a868", "#c44e52", "#8172b3", "#937860"]
+    )
+    coop_color_map = {p: palette[i % len(palette)] for i, p in enumerate(pairs_unique)}
+
 
     ef = (fermi_from_occ(eps_eV, occ, ewin) if midgap is None else float(midgap))
 
@@ -607,12 +768,12 @@ def plot_fuzzy_pdos_coop_combo(
         vals = np.asarray(coop_weights.get(p))
         if Ener_sticks.size == 0 or vals.size == 0:
             continue
-        vV = vals[mask_sticks]
+        vV = np.clip(scale_norm * vals[mask_sticks], -1.0, 1.0)
         col = coop_color_map.get(p, "#555555")
         axC.hlines(Ener_sticks, 0.0, vV, colors=col, linewidths=1.1, alpha=0.65)
         x_max = max(x_max, np.max(np.abs(vV)))
         coop_handles.append(Line2D([0], [0], color=col, lw=2, label=f"{p} (+/−)"))
-    axC.set_xlim(-x_max*1.05 if x_max>0 else -1.0, x_max*1.05 if x_max>0 else 1.0)
+    axC.set_xlim(-1.05, 1.05)
 
     # Legends + slimmer colorbar
     axLeg.axis("off")
@@ -633,13 +794,18 @@ def plot_fuzzy_pdos_coop_combo(
 
     # ---- CSV exports (fuzzy & PDOS unchanged; COOP exports sticks for filtered pairs) ----
     # fuzzy
-    with open("fuzzy_data.csv", "w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(["Energy_eV", "k_index", "Fuzzy_Intensity"])
-        for iE, E in enumerate(fuzzy.centres):
-            for ik in range(ncol):
-                w.writerow([E, ik, fuzzy.intensity_grid[iE, ik]])
-    print("  ✓ Exported fuzzy → fuzzy_data.csv")
+    # --- Compact binary export (recommended) ---
+    np.savez_compressed(
+        "fuzzy_data.npz",
+        centres=fuzzy.centres.astype(np.float16),
+        intensity=fuzzy.intensity_grid.astype(np.float16),
+        tick_positions=np.asarray(fuzzy.tick_positions, dtype=np.float16),
+        tick_labels=np.asarray(fuzzy.tick_labels, dtype=object),
+        labels=np.asarray(fuzzy.labels, dtype=object),
+        extent=np.asarray(fuzzy.extent, dtype=np.float16),
+        ewin=np.asarray(ewin, dtype=np.float16),
+    )
+    print("  ✓ Exported fuzzy → fuzzy_data.npz (compressed)")
 
     # pdos
     if Ycum is not None and len(labels_p) > 0:
