@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
 import numpy as np
 from scipy.linalg import eigh
 from collections import defaultdict
@@ -201,6 +204,104 @@ def print_coop_analysis(coop_weights, eps, occ, ewin=None, include_unocc=True):
         occ_str = f"{occ[n]:.1f}" if occ is not None else "NA"
         print(f"MO {n:4d}  E={eps[n]:8.3f} eV  occ={occ_str}  |  " + "  ;  ".join(parts))
 
+# ------------------ Helper utilities for plotting ------------------
+
+@dataclass
+class FuzzyMapData:
+    centres: np.ndarray
+    intensity_grid: np.ndarray
+    labels: List[str]
+    tick_positions: List[float]
+    tick_labels: List[str]
+    extent: Tuple[float, float, float, float]
+    norm: Normalize
+    cmap: plt.Colormap
+    energy_window: Tuple[float, float]
+
+
+def _sym_to_atom_indices(shells) -> Dict[str, np.ndarray]:
+    atom_idx_shell = np.array([int(sh["atom_idx"]) for sh in shells], dtype=int)
+    sym_shell = np.array([sh["sym"] for sh in shells], dtype=object)
+    return {
+        sym: np.unique(atom_idx_shell[sym_shell == sym])
+        for sym in set(sym_shell)
+    }
+
+
+def _prepare_pdos_data(C, S, shells, method="mulliken"):
+    pdos_weights = compute_pdos_weights(C, S, method=method)
+    projected = project_pdos(pdos_weights, shells)
+    sym_to_atom_indices = _sym_to_atom_indices(shells)
+    return pdos_weights, projected, sym_to_atom_indices
+
+
+def _pdos_curves_for_symbols(projected, sym_to_atom_indices, pdos_atom_list,
+                             eps, energy_axis, sigma):
+    curves, labels = [], []
+    for sym in pdos_atom_list:
+        rows = sym_to_atom_indices.get(sym, np.array([], dtype=int))
+        if rows.size == 0:
+            continue
+        weights_mo = projected[rows, :].sum(axis=0)
+        curves.append(broaden(weights_mo, eps, energy_axis, sigma))
+        labels.append(sym)
+    if not curves:
+        return [], [], None
+    Y = np.column_stack(curves)
+    return curves, labels, np.cumsum(Y, axis=1)
+
+
+def _prepare_fuzzy_map(kpts_cart, labels, intensity, eps_eV, ewin,
+                       sigma_ev, scaled_vmin):
+    from .plotting import dedup_kpath_strict, _plain_k_label, _fade_cmap
+
+    _, labels_dedup, keep = dedup_kpath_strict(np.asarray(kpts_cart), labels)
+    I = np.asarray(intensity)[:, keep]
+
+    E = np.asarray(eps_eV)
+    window_mask = (E >= ewin[0] - 4 * sigma_ev) & (E <= ewin[1] + 4 * sigma_ev)
+    E = E[window_mask]
+    I = I[window_mask, :]
+
+    dE = max(0.5 * sigma_ev, 0.01)
+    edges = np.arange(ewin[0], ewin[1] + dE, dE)
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    Z = np.zeros((centres.size, I.shape[1]), dtype=float)
+    for En, Ik in zip(E, I):
+        w = np.exp(-0.5 * ((centres - En) / sigma_ev) ** 2)
+        Z += np.outer(w, Ik)
+
+    vmax = np.percentile(Z, 99.9) if np.any(Z > 0) else 1.0
+    pos = Z[Z > 0]
+    vmin = np.percentile(pos, 5) if pos.size else 1e-6
+    vmin_eff = max(vmin, vmax / float(scaled_vmin)) if scaled_vmin is not None else vmin
+    if vmin_eff >= vmax:
+        vmin_eff = max(vmax * 0.5, 1e-8)
+    norm = LogNorm(vmin=vmin_eff, vmax=vmax)
+    cmap = _fade_cmap()
+    cmap.set_bad('black')
+    cmap.set_under('black')
+
+    tick_pos, tick_lab, prev = [], [], None
+    for i, lbl in enumerate(labels_dedup):
+        if lbl and lbl != prev:
+            tick_pos.append(float(i))
+            tick_lab.append(_plain_k_label(lbl))
+            prev = lbl
+
+    extent = (0.0, float(Z.shape[1] - 1), float(centres.min()), float(centres.max()))
+    return FuzzyMapData(
+        centres=centres,
+        intensity_grid=Z,
+        labels=list(labels_dedup),
+        tick_positions=tick_pos,
+        tick_labels=tick_lab,
+        extent=extent,
+        norm=norm,
+        cmap=cmap,
+        energy_window=(float(ewin[0]), float(ewin[1])),
+    )
+
 # ------------------ Plot wrappers (original workflow preserved) ------------------
 
 def plot_dos_and_pdos(eps, occ, C, S, shells, pdos_atom_list, ewin,
@@ -218,34 +319,20 @@ def plot_dos_and_pdos(eps, occ, C, S, shells, pdos_atom_list, ewin,
     dos_states = compute_dos_states(eps, energy_grid, sigma)
 
     # PDOS weights and atom-projected (nAtoms, nMO)
-    pdos_weights = compute_pdos_weights(C, S, method=method)
-    projected = project_pdos(pdos_weights, shells)
-
-    # Map: atom symbol -> unique atom indices (avoid double-counting same atom)
-    atom_idx_shell = np.array([int(sh["atom_idx"]) for sh in shells], dtype=int)
-    sym_shell      = np.array([sh["sym"] for sh in shells], dtype=object)
-    sym_to_atom_indices = {
-        sym: np.unique(atom_idx_shell[sym_shell == sym])
-        for sym in set(sym_shell)
-    }
+    _, projected, sym_to_atom_indices = _prepare_pdos_data(C, S, shells, method=method)
 
     # Build per-symbol PDOS curves (NO occupation weighting → include LUMOs)
-    curves, labels = [], []
-    for sym in pdos_atom_list:
-        atom_rows = sym_to_atom_indices.get(sym, np.array([], dtype=int))
-        if atom_rows.size == 0:
-            continue
-        weights_mo = projected[atom_rows, :].sum(axis=0)  # (nMO,)
-        curve = broaden(weights_mo, eps, energy_grid, sigma)  # (nE,)
-        curves.append(curve)
-        labels.append(sym)
+    curves, labels, Ycum = _pdos_curves_for_symbols(
+        projected, sym_to_atom_indices, pdos_atom_list, eps, energy_grid, sigma
+    )
 
     if not curves:
         print("  ⚠︎ No PDOS curves to plot (empty pdos_atom_list or no matching atoms).")
         return
 
-    Y = np.column_stack(curves)            # (nE, nTypes)
-    Ycum = np.cumsum(Y, axis=1)            # cumulative for stacked fill
+    if Ycum is None:
+        Y = np.column_stack(curves)
+        Ycum = np.cumsum(Y, axis=1)
     zero = np.zeros_like(energy_grid)
 
     plt.figure(figsize=(7.0, 4.4))
@@ -322,111 +409,73 @@ def plot_fuzzy_and_pdos_combo(
     scaled_vmin=1e-4,       # match your CLI/standalone fuzzy
 ):
     import matplotlib.pyplot as plt
-    import matplotlib.colors as mcolors
     from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
-    from .plotting import dedup_kpath_strict, _plain_k_label, _fade_cmap
 
-    # ---- fuzzy grid (exactly like your standalone) ----
-    kpts_dedup, labels_dedup, keep = dedup_kpath_strict(np.asarray(kpts_cart), labels)
-    I = intensity[:, keep]
-    ncol = I.shape[1]
+    fuzzy = _prepare_fuzzy_map(
+        kpts_cart, labels, intensity, eps_eV, ewin, sigma_ev, scaled_vmin
+    )
 
-    E = np.asarray(eps_eV)
-    in_win = (E >= ewin[0] - 4*sigma_ev) & (E <= ewin[1] + 4*sigma_ev)
-    E, I = E[in_win], I[in_win, :]
+    _, projected, sym_to_atom = _prepare_pdos_data(C, S, shells, method="mulliken")
+    curves, labels_p, Ycum = _pdos_curves_for_symbols(
+        projected, sym_to_atom, pdos_atom_list, eps_eV, fuzzy.centres, sigma_pdos
+    )
 
-    dE = max(0.5*sigma_ev, 0.01)
-    edges   = np.arange(ewin[0], ewin[1] + dE, dE)
-    centres = 0.5 * (edges[:-1] + edges[1:])
-    Z = np.zeros((centres.size, ncol), dtype=float)
-    for En, Ik in zip(E, I):
-        w = np.exp(-0.5 * ((centres - En) / sigma_ev) ** 2)
-        Z += np.outer(w, Ik)
-
-    vmax = np.percentile(Z, 99.9) if np.any(Z > 0) else 1.0
-    pos  = Z[Z > 0]
-    vmin = np.percentile(pos, 5) if pos.size else 1e-6
-    vmin_eff = max(vmin, vmax/float(scaled_vmin))
-    if vmin_eff >= vmax:
-        vmin_eff = max(vmax * 0.5, 1e-8)
-    norm = mcolors.LogNorm(vmin=vmin_eff, vmax=vmax)
-    cmap = _fade_cmap(); cmap.set_bad('black'); cmap.set_under('black')
-
-    # ---- PDOS (cumulative, same energy grid "centres") ----
-    pdos_weights = compute_pdos_weights(C, S, method="mulliken")
-    projected = project_pdos(pdos_weights, shells)
-    atom_idx_shell = np.array([int(sh["atom_idx"]) for sh in shells], dtype=int)
-    sym_shell      = np.array([sh["sym"] for sh in shells], dtype=object)
-    sym_to_atom_indices = {
-        sym: np.unique(atom_idx_shell[sym_shell == sym]) for sym in set(sym_shell)
-    }
-
-    curves, labels_p = [], []
-    for sym in pdos_atom_list:
-        rows = sym_to_atom_indices.get(sym, np.array([], dtype=int))
-        if rows.size == 0:
-            continue
-        w_mo = projected[rows, :].sum(axis=0)
-        curves.append(broaden(w_mo, eps_eV, centres, sigma_pdos))
-        labels_p.append(sym)
-
-    Ycum, xmax = None, 1.0
-    if curves:
-        Y = np.column_stack(curves)
-        Ycum = np.cumsum(Y, axis=1)
-        xmax = float(Ycum.max()) * 1.05 if Ycum.size else 1.0
+    xmax = 1.0
+    if Ycum is not None and Ycum.size:
+        xmax = float(Ycum.max()) * 1.05
 
     ef = (fermi_from_occ(eps_eV, occ, ewin) if midgap is None else float(midgap))
 
-    # ---- Layout: [85% fuzzy] | [12% PDOS] | [3% info column] ----
     fig = plt.figure(figsize=(9.6, 5.4), constrained_layout=False)
     gs = GridSpec(1, 100, figure=fig, wspace=0.05)
-    axL   = fig.add_subplot(gs[0, :85])      # left fuzzy
-    axR   = fig.add_subplot(gs[0, 85:97], sharey=axL)  # PDOS
+    axL = fig.add_subplot(gs[0, :85])
+    axR = fig.add_subplot(gs[0, 85:97], sharey=axL)
     infoS = GridSpecFromSubplotSpec(2, 1, subplot_spec=gs[0, 97:], height_ratios=[3, 2], hspace=0.15)
-    axLeg = fig.add_subplot(infoS[0])        # legend panel (axes turned off)
-    axC   = fig.add_subplot(infoS[1])        # colorbar panel
+    axLeg = fig.add_subplot(infoS[0])
+    axC = fig.add_subplot(infoS[1])
 
-    # ---- Draw fuzzy (left) ----
-    extent = [0, ncol-1, centres.min(), centres.max()]
-    im = axL.imshow(Z, origin='lower', aspect='auto', extent=extent, cmap=cmap, norm=norm)
+    extent = [fuzzy.extent[0], fuzzy.extent[1], fuzzy.extent[2], fuzzy.extent[3]]
+    im = axL.imshow(
+        fuzzy.intensity_grid,
+        origin='lower',
+        aspect='auto',
+        extent=extent,
+        cmap=fuzzy.cmap,
+        norm=fuzzy.norm,
+    )
     axL.set_facecolor('black')
-    axL.set_ylim(ewin)
+    axL.set_ylim(fuzzy.energy_window)
     axL.set_ylabel("Energy (eV)")
     axL.set_xlabel("High-Symmetry k-Path")
-    # HS ticks
-    tick_pos, tick_lab, prev = [], [], None
-    for i, lbl in enumerate(labels_dedup):
-        if lbl and lbl != prev:
-            tick_pos.append(float(i))
-            tick_lab.append(_plain_k_label(lbl))
+    prev_label = None
+    for i, lbl in enumerate(fuzzy.labels):
+        if lbl and lbl != prev_label:
             axL.axvline(i, color='gray', lw=0.5, alpha=0.6)
-            prev = lbl
-    axL.set_xticks(tick_pos); axL.set_xticklabels(tick_lab)
+            prev_label = lbl
+    axL.set_xticks(fuzzy.tick_positions)
+    axL.set_xticklabels(fuzzy.tick_labels)
     axL.axhline(ef, color='w', ls='--', lw=1.2, alpha=0.9)
 
-    # ---- Draw PDOS (right-mid), hide duplicate y ----
     axR.tick_params(left=False, labelleft=False)
     axR.spines["left"].set_visible(False)
     handles = []
     if Ycum is not None:
-        prev = np.zeros_like(centres)
+        prev = np.zeros_like(fuzzy.centres)
         for j in range(Ycum.shape[1]):
-            p = axR.fill_betweenx(centres, prev, Ycum[:, j], alpha=0.75, linewidth=0.0, label=labels_p[j])
+            p = axR.fill_betweenx(
+                fuzzy.centres, prev, Ycum[:, j], alpha=0.75, linewidth=0.0, label=labels_p[j]
+            )
             handles.append(p)
             prev = Ycum[:, j]
         axR.set_xlim(0.0, xmax)
-        axR.set_xlabel("PDOS (a.u.)")
     else:
         axR.set_xlim(0.0, 1.0)
-        axR.set_xlabel("PDOS (a.u.)")
+    axR.set_xlabel("PDOS (a.u.)")
 
-    # ---- Legend in its own panel (never overlaps) ----
     axLeg.axis("off")
-    if labels_p:
+    if handles:
         axLeg.legend(handles, labels_p, loc="upper left", frameon=False, fontsize=9)
 
-    # ---- Colorbar below the legend (same narrow info column) ----
     cb = plt.colorbar(im, cax=axC, orientation='vertical')
     cb.set_label("Intensity (arb., log scale)", fontsize=9)
 
@@ -444,51 +493,21 @@ def plot_fuzzy_pdos_coop_combo(
     outfile="fuzzy_pdos_coop.png",
     scaled_vmin=1e-4,
 ):
-    import matplotlib.pyplot as plt
-    import matplotlib.colors as mcolors
-    from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
-    from matplotlib.lines import Line2D
-    from .plotting import dedup_kpath_strict, _plain_k_label, _fade_cmap
     import csv
     import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
+    from matplotlib.lines import Line2D
 
-    # -------- Fuzzy grid (unchanged) --------
-    kpts_dedup, labels_dedup, keep = dedup_kpath_strict(np.asarray(kpts_cart), labels)
-    I = intensity[:, keep]; ncol = I.shape[1]
-    E = np.asarray(eps_eV)
-    in_win = (E >= ewin[0] - 4*sigma_ev) & (E <= ewin[1] + 4*sigma_ev)
-    E, I = E[in_win], I[in_win, :]
+    fuzzy = _prepare_fuzzy_map(
+        kpts_cart, labels, intensity, eps_eV, ewin, sigma_ev, scaled_vmin
+    )
+    ncol = fuzzy.intensity_grid.shape[1]
 
-    dE = max(0.5*sigma_ev, 0.01)
-    edges   = np.arange(ewin[0], ewin[1] + dE, dE)
-    centres = 0.5 * (edges[:-1] + edges[1:])
-    Z = np.zeros((centres.size, ncol), dtype=float)
-    for En, Ik in zip(E, I):
-        w = np.exp(-0.5 * ((centres - En) / sigma_ev) ** 2)
-        Z += np.outer(w, Ik)
-
-    vmax = np.percentile(Z, 99.9) if np.any(Z > 0) else 1.0
-    pos  = Z[Z > 0]; vmin = np.percentile(pos, 5) if pos.size else 1e-6
-    vmin_eff = max(vmin, vmax/float(scaled_vmin))
-    if vmin_eff >= vmax: vmin_eff = max(vmax * 0.5, 1e-8)
-    norm = mcolors.LogNorm(vmin=vmin_eff, vmax=vmax)
-    cmap = _fade_cmap(); cmap.set_bad('black'); cmap.set_under('black')
-
-    # -------- PDOS (unchanged) --------
-    pdos_weights = compute_pdos_weights(C, S, method="mulliken")
-    projected = project_pdos(pdos_weights, shells)
-    atom_idx_shell = np.array([int(sh["atom_idx"]) for sh in shells], dtype=int)
-    sym_shell      = np.array([sh["sym"] for sh in shells], dtype=object)
-    sym_to_atom_indices = {sym: np.unique(atom_idx_shell[sym_shell == sym]) for sym in set(sym_shell)}
-
-    curves_p, labels_p = [], []
-    for sym in pdos_atom_list:
-        rows = sym_to_atom_indices.get(sym, np.array([], dtype=int))
-        if rows.size == 0: continue
-        w_mo = projected[rows, :].sum(axis=0)
-        curves_p.append(broaden(w_mo, eps_eV, centres, sigma_pdos))
-        labels_p.append(sym)
-    Ycum = np.cumsum(np.column_stack(curves_p), axis=1) if curves_p else None
+    _, projected, sym_to_atom = _prepare_pdos_data(C, S, shells, method="mulliken")
+    curves_p, labels_p, Ycum = _pdos_curves_for_symbols(
+        projected, sym_to_atom, pdos_atom_list, eps_eV, fuzzy.centres, sigma_pdos
+    )
 
     # -------- COOP: keep only direct bonds Hg–Te and Hg–Cl (order-insensitive) --------
     def _canonical_pair(p):
@@ -511,10 +530,8 @@ def plot_fuzzy_pdos_coop_combo(
         if p not in seen:
             seen.add(p); pairs_unique.append(p)
 
-    # compute COOP only for the filtered pairs
     coop_weights = compute_coop(C, S, shells, pairs_unique)
 
-    # energies to draw sticks (within window)
     E_all = np.asarray(eps_eV)
     mask_sticks = (E_all >= ewin[0]) & (E_all <= ewin[1])
     Ener_sticks = E_all[mask_sticks]
@@ -527,40 +544,52 @@ def plot_fuzzy_pdos_coop_combo(
 
     ef = (fermi_from_occ(eps_eV, occ, ewin) if midgap is None else float(midgap))
 
-    # -------- Layout --------
     fig = plt.figure(figsize=(12, 5.4), constrained_layout=False)
-    gs  = GridSpec(1, 120, figure=fig, wspace=0.05)
-    axF = fig.add_subplot(gs[0, :70])                # fuzzy
-    axP = fig.add_subplot(gs[0, 70:85],  sharey=axF) # PDOS
-    axC = fig.add_subplot(gs[0, 85:100], sharey=axF) # COOP sticks
+    gs = GridSpec(1, 120, figure=fig, wspace=0.05)
+    axF = fig.add_subplot(gs[0, :70])
+    axP = fig.add_subplot(gs[0, 70:85], sharey=axF)
+    axC = fig.add_subplot(gs[0, 85:100], sharey=axF)
     infoS = GridSpecFromSubplotSpec(2, 1, subplot_spec=gs[0, 100:], height_ratios=[3, 2], hspace=0.15)
-    axLeg = fig.add_subplot(infoS[0])                # legend
-    axBar = fig.add_subplot(infoS[1])                # colorbar
+    axLeg = fig.add_subplot(infoS[0])
+    axBar = fig.add_subplot(infoS[1])
 
-    # Fuzzy
-    extent = [0, ncol-1, centres.min(), centres.max()]
-    im = axF.imshow(Z, origin='lower', aspect='auto', extent=extent, cmap=cmap, norm=norm)
-    axF.set_facecolor('black'); axF.set_ylim(ewin)
-    axF.set_ylabel("Energy (eV)"); axF.set_xlabel("High-Symmetry k-Path")
-    tick_pos, tick_lab, prev = [], [], None
-    for i, lbl in enumerate(labels_dedup):
-        if lbl and lbl != prev:
-            tick_pos.append(float(i)); tick_lab.append(_plain_k_label(lbl))
-            axF.axvline(i, color='gray', lw=0.5, alpha=0.6); prev = lbl
-    axF.set_xticks(tick_pos); axF.set_xticklabels(tick_lab)
+    extent = [fuzzy.extent[0], fuzzy.extent[1], fuzzy.extent[2], fuzzy.extent[3]]
+    im = axF.imshow(
+        fuzzy.intensity_grid,
+        origin='lower',
+        aspect='auto',
+        extent=extent,
+        cmap=fuzzy.cmap,
+        norm=fuzzy.norm,
+    )
+    axF.set_facecolor('black')
+    axF.set_ylim(fuzzy.energy_window)
+    axF.set_ylabel("Energy (eV)")
+    axF.set_xlabel("High-Symmetry k-Path")
+    prev_label = None
+    for i, lbl in enumerate(fuzzy.labels):
+        if lbl and lbl != prev_label:
+            axF.axvline(i, color='gray', lw=0.5, alpha=0.6)
+            prev_label = lbl
+    axF.set_xticks(fuzzy.tick_positions)
+    axF.set_xticklabels(fuzzy.tick_labels)
     axF.axhline(ef, color='w', ls='--', lw=1.2, alpha=0.9)
 
-    # PDOS
-    axP.tick_params(left=False, labelleft=False); axP.spines["left"].set_visible(False)
+    axP.tick_params(left=False, labelleft=False)
+    axP.spines["left"].set_visible(False)
     handles_p = []
     if Ycum is not None:
-        prev = np.zeros_like(centres)
+        prev = np.zeros_like(fuzzy.centres)
         for j in range(Ycum.shape[1]):
-            p = axP.fill_betweenx(centres, prev, Ycum[:, j], alpha=0.75, linewidth=0.0, label=labels_p[j])
-            handles_p.append(p); prev = Ycum[:, j]
-        axP.set_xlim(0, float(Ycum.max())*1.05); axP.set_xlabel("PDOS")
+            p = axP.fill_betweenx(
+                fuzzy.centres, prev, Ycum[:, j], alpha=0.75, linewidth=0.0, label=labels_p[j]
+            )
+            handles_p.append(p)
+            prev = Ycum[:, j]
+        axP.set_xlim(0, float(Ycum.max()) * 1.05)
     else:
-        axP.set_xlim(0, 1); axP.set_xlabel("PDOS")
+        axP.set_xlim(0, 1)
+    axP.set_xlabel("PDOS")
 
     # COOP sticks: plot both allowed pairs with semi-transparency; weakest → strongest
     axC.tick_params(left=False, labelleft=False); axC.spines["left"].set_visible(False)
@@ -576,12 +605,13 @@ def plot_fuzzy_pdos_coop_combo(
     x_max = 0.0
     for p in order:
         vals = np.asarray(coop_weights.get(p))
-        if Ener_sticks.size == 0 or vals.size == 0: continue
-        vV  = vals[mask_sticks]
+        if Ener_sticks.size == 0 or vals.size == 0:
+            continue
+        vV = vals[mask_sticks]
         col = coop_color_map.get(p, "#555555")
         axC.hlines(Ener_sticks, 0.0, vV, colors=col, linewidths=1.1, alpha=0.65)
         x_max = max(x_max, np.max(np.abs(vV)))
-        coop_handles.append(Line2D([0],[0], color=col, lw=2, label=f"{p} (+/−)"))
+        coop_handles.append(Line2D([0], [0], color=col, lw=2, label=f"{p} (+/−)"))
     axC.set_xlim(-x_max*1.05 if x_max>0 else -1.0, x_max*1.05 if x_max>0 else 1.0)
 
     # Legends + slimmer colorbar
@@ -594,9 +624,8 @@ def plot_fuzzy_pdos_coop_combo(
 
     cb = plt.colorbar(im, cax=axBar, orientation='vertical')
     cb.set_label("Intensity (arb., log scale)", fontsize=9)
-    # make colorbar a bit narrower
     bbox = axBar.get_position()
-    axBar.set_position([bbox.x0 + 0.35*bbox.width, bbox.y0, 0.55*bbox.width, bbox.height])
+    axBar.set_position([bbox.x0 + 0.35 * bbox.width, bbox.y0, 0.55 * bbox.width, bbox.height])
 
     fig.savefig(outfile, dpi=300, bbox_inches="tight")
     print(f"✓ Combined fuzzy+PDOS+COOP plot saved to {outfile}")
@@ -605,19 +634,19 @@ def plot_fuzzy_pdos_coop_combo(
     # ---- CSV exports (fuzzy & PDOS unchanged; COOP exports sticks for filtered pairs) ----
     # fuzzy
     with open("fuzzy_data.csv", "w", newline="") as fh:
-        import csv; w = csv.writer(fh)
-        w.writerow(["Energy_eV","k_index","Fuzzy_Intensity"])
-        for iE, E in enumerate(centres):
+        w = csv.writer(fh)
+        w.writerow(["Energy_eV", "k_index", "Fuzzy_Intensity"])
+        for iE, E in enumerate(fuzzy.centres):
             for ik in range(ncol):
-                w.writerow([E, ik, Z[iE, ik]])
+                w.writerow([E, ik, fuzzy.intensity_grid[iE, ik]])
     print("  ✓ Exported fuzzy → fuzzy_data.csv")
 
     # pdos
     if Ycum is not None and len(labels_p) > 0:
         with open("pdos_data.csv", "w", newline="") as fh:
-            import csv; w = csv.writer(fh)
+            w = csv.writer(fh)
             w.writerow(["Energy_eV"] + labels_p)
-            for iE, E in enumerate(centres):
+            for iE, E in enumerate(fuzzy.centres):
                 row = [E] + [Ycum[iE, j] for j in range(len(labels_p))]
                 w.writerow(row)
         print("  ✓ Exported PDOS → pdos_data.csv")
@@ -625,7 +654,7 @@ def plot_fuzzy_pdos_coop_combo(
     # coop sticks
     if len(pairs_unique) > 0 and Ener_sticks.size > 0:
         with open("coop_data.csv", "w", newline="") as fh:
-            import csv; w = csv.writer(fh)
+            w = csv.writer(fh)
             w.writerow(["MO_Energy_eV"] + pairs_unique)
             cols = [np.asarray(coop_weights[p])[mask_sticks] for p in pairs_unique]
             for i in range(Ener_sticks.size):
