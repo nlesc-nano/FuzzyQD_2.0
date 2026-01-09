@@ -229,7 +229,7 @@ def main():
         outfile=outfile_name, midgap=midgap
     )
 
-    # --- [9] Analysis (DOS, PDOS, COOP) ---
+    # --- [9] Analysis (DOS, PDOS, COOP, IPR) ---
     if args.dos or args.coop:
         print("\n--- [9] Analysis ---")
         t0 = perf_counter()
@@ -264,7 +264,11 @@ def main():
                 sigma=(args.sigma_ev or 0.1)
             )
             analysis.print_coop_analysis(coop_weights, eps_eV, occ)
-
+            
+        if args.ipr:
+            ipr, atom_ampl = analysis.compute_ipr(C_like, S, shells, use_loewdin=True)
+            analysis.write_ipr_txt(eps_eV, ipr, fname="IPR.txt")
+            
         # --- [9.5] Combined fuzzy + PDOS figure (shared energy axis) ---
         try:
             # --- [8b] Combined panels on demand ---
