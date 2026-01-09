@@ -78,7 +78,8 @@ def get_args():
     parser.add_argument("--coop", nargs='+', type=str, help="List of atom pairs for COOP (e.g., Hg-Te), or 'all'.")
     parser.add_argument("--population_analysis", type=str, default="mulliken", choices=["mulliken", "lowdin"],
                         help="Population analysis method for PDOS and COOP.")
-
+    parser.add_argument("--ipr", action="store_true", help="PR and IPR calculation.")
+    
     # Threading / BLAS control
     parser.add_argument("--no_thread_autoset", action="store_true",
         help="Do not auto-configure OpenMP/BLAS threads; use the environment as-is.")

@@ -209,6 +209,56 @@ def print_coop_analysis(coop_weights, eps, occ, ewin=None, include_unocc=True):
         occ_str = f"{occ[n]:.1f}" if occ is not None else "NA"
         print(f"MO {n:4d}  E={eps[n]:8.3f} eV  occ={occ_str}  |  " + "  ;  ".join(parts))
 
+def compute_ipr(C, S, shells, use_loewdin=True):
+    """
+    Compute the Inverse Participation Ratio (IPR) for each MO as 
+    IPR = Σα|Pα,i|⁴ / (Σα|Pα,i|²)²
+    where Pα,i represents the weight of MO i on a given
+    atom α expanded in an atomic orbital basis.
+    """
+    if use_loewdin:
+        try:
+            S_half = sqrtm(S)
+            C_eff = S_half @ C
+        except MemoryError:
+            print("  Not enough memory for Löwdin transformation, using untransformed C.")
+            C_eff = C
+    else:
+        C_eff = C
+
+    atom_idx_ao, sym_ao, l_ao = shells_to_ao_arrays(shells)
+    atom_idx_ao = np.asarray(atom_idx_ao, dtype=int)
+
+    n_atoms = atom_idx_ao.max() + 1
+    n_mo = C_eff.shape[1]
+
+    atom_ampl = np.zeros((n_atoms, n_mo), dtype=C_eff.dtype)
+    for a in range(n_atoms):
+        idx = np.where(atom_idx_ao == a)[0]
+        if idx.size:
+            atom_ampl[a, :] = C_eff[idx, :].sum(axis=0)
+
+    abs2 = np.abs(atom_ampl)**2
+    num = (abs2**2).sum(axis=0)
+    den = (abs2.sum(axis=0))**2 + 1e-30
+    ipr = (num / den).real
+
+    print(f"  ✓ IPR computed for {n_mo} molecular orbitals and {n_atoms} atoms.")
+    return ipr, atom_ampl
+
+
+def write_ipr_txt(eps, ipr, fname="IPR.txt"):
+    """
+    Save energies, IPR and participation ratio (PR = 1/IPR) for all provided MOs.
+    """
+    result = np.zeros((len(ipr), 3), dtype=float)
+    result[:, 0] = eps
+    result[:, 1] = ipr
+
+    result[:, 2] = 1.0 / (ipr + 1e-30)
+    np.savetxt(fname, result)
+    return result
+    
 # ------------------ Helper utilities for plotting ------------------
 
 @dataclass
